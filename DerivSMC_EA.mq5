@@ -2,10 +2,11 @@
 //|                                                  DerivSMC_EA.mq5 |
 //|  Multi-Pair | CRT + Rejection + OrderBlock | Trailing + BE       |
 //|  Works on Synthetics + Gold + Forex | Fixed $ Risk               |
+//|  v1.23: market structure on setup TF, M1 market-entry timing     |
 //+------------------------------------------------------------------+
 #property copyright "Dave-4u"
 #property link      "https://github.com/Dave-4u/Deriv-SMC-EA"
-#property version   "1.20"
+#property version   "1.23"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -13,7 +14,7 @@ CTrade trade;
 
 //------------------- INPUTS ----------------------------------------
 input group "=== MULTI-PAIR & RISK ==="
-input string   SymbolsList           = "Volatility 75 Index,Volatility 100 Index,Boom 1000 Index,Crash 500 Index,XAUUSD"; 
+input string   SymbolsList           = "Volatility 75 Index,Volatility 100 Index,Boom 1000 Index,Crash 500 Index,XAUUSD";
 input double   RiskMoney             = 3.0;        // Default risk in $
 input int      MaxOpenTrades         = 10;
 input string   CustomRiskList        = "";         // Optional: Symbol:Risk,Symbol:Risk (e.g. XAUUSD:5,Volatility 75 Index:2.5)
@@ -30,11 +31,19 @@ input bool     EnableOrderBlock      = true;
 
 input group "=== TIMEFRAMES ==="
 input ENUM_TIMEFRAMES TrendTF        = PERIOD_H1;
-input ENUM_TIMEFRAMES EntryTF        = PERIOD_M5;
+input ENUM_TIMEFRAMES EntryTF        = PERIOD_M5;  // Setup timeframe (strategies + structure)
+input ENUM_TIMEFRAMES ExecTF         = PERIOD_M1;  // Timing chart for market entry
 
-input group "=== TREND FILTER ==="
+input group "=== TREND & STRUCTURE ==="
 input int      EMA_Period            = 50;
 input int      CooldownBars          = 12;
+input bool     UseMarketStructure    = true;       // Require setup-TF structure to agree with trend
+input int      StructureLookback     = 50;         // Bars on EntryTF to read swings
+input int      SwingStrength         = 2;          // Pivot bars on each side
+
+input group "=== M1 ENTRY TIMING ==="
+input bool     UseM1EntryTiming      = true;       // If false, enter at market when the setup appears
+input int      SetupExpireM1Bars     = 15;         // Pending setup dies after this many new M1 bars
 
 input group "=== TRADE MANAGEMENT ==="
 input double   RR_Ratio              = 2.0;
@@ -61,9 +70,12 @@ struct SymbolData
    string   name;
    double   risk;
    datetime lastBar;
+   datetime lastExecBar;
    int      cooldown;
    int      atrHandle;
    int      emaHandle;
+   int      pendingSignal;
+   int      pendingAgeM1;
 };
 
 SymbolData symbols[];
@@ -74,20 +86,25 @@ datetime   dailyStartDate = 0;
 //------------------- INITIALIZATION ---------------------------------
 int OnInit()
 {
-   // Parse main symbols list
-   string temp = SymbolsList;
-   StringReplace(temp, " ", "");
+   // Parse main symbols list (keep spaces inside names; trim only around commas)
    string baseSymbols[];
-   int baseCount = StringSplit(temp, ',', baseSymbols);
+   int baseCount = StringSplit(SymbolsList, ',', baseSymbols);
+   for(int i = 0; i < baseCount; i++)
+   {
+      StringTrimLeft(baseSymbols[i]);
+      StringTrimRight(baseSymbols[i]);
+   }
 
-   // Parse custom risk list
    string customPairs[];
    int customCount = 0;
    if(StringLen(CustomRiskList) > 0)
    {
-      string cr = CustomRiskList;
-      StringReplace(cr, " ", "");
-      customCount = StringSplit(cr, ',', customPairs);
+      customCount = StringSplit(CustomRiskList, ',', customPairs);
+      for(int c = 0; c < customCount; c++)
+      {
+         StringTrimLeft(customPairs[c]);
+         StringTrimRight(customPairs[c]);
+      }
    }
 
    ArrayResize(symbols, baseCount);
@@ -97,17 +114,31 @@ int OnInit()
    {
       if(StringLen(baseSymbols[i]) < 2) continue;
 
-      symbols[symbolCount].name = baseSymbols[i];
-      symbols[symbolCount].risk = RiskMoney;          // default
-      symbols[symbolCount].lastBar = 0;
-      symbols[symbolCount].cooldown = 0;
+      if(!SymbolSelect(baseSymbols[i], true))
+      {
+         Print("Symbol not found: ", baseSymbols[i]);
+         continue;
+      }
 
-      // Check if custom risk exists for this symbol
+      symbols[symbolCount].name = baseSymbols[i];
+      symbols[symbolCount].risk = RiskMoney;
+      symbols[symbolCount].lastBar = 0;
+      symbols[symbolCount].lastExecBar = 0;
+      symbols[symbolCount].cooldown = 0;
+      symbols[symbolCount].atrHandle = INVALID_HANDLE;
+      symbols[symbolCount].emaHandle = INVALID_HANDLE;
+      symbols[symbolCount].pendingSignal = 0;
+      symbols[symbolCount].pendingAgeM1 = 0;
+
       for(int c = 0; c < customCount; c++)
       {
          string parts[];
          if(StringSplit(customPairs[c], ':', parts) == 2)
          {
+            StringTrimLeft(parts[0]);
+            StringTrimRight(parts[0]);
+            StringTrimLeft(parts[1]);
+            StringTrimRight(parts[1]);
             if(parts[0] == baseSymbols[i])
             {
                symbols[symbolCount].risk = StringToDouble(parts[1]);
@@ -116,16 +147,19 @@ int OnInit()
          }
       }
 
-      // Create indicator handles
-      symbols[symbolCount].atrHandle = iATR(baseSymbols[i], EntryTF, 14);
-      symbols[symbolCount].emaHandle = iMA(baseSymbols[i], TrendTF, EMA_Period, 0, MODE_EMA, PRICE_CLOSE);
+      int atrHandle = iATR(baseSymbols[i], EntryTF, 14);
+      int emaHandle = iMA(baseSymbols[i], TrendTF, EMA_Period, 0, MODE_EMA, PRICE_CLOSE);
 
-      if(symbols[symbolCount].atrHandle == INVALID_HANDLE || symbols[symbolCount].emaHandle == INVALID_HANDLE)
+      if(atrHandle == INVALID_HANDLE || emaHandle == INVALID_HANDLE)
       {
          Print("Failed to create handles for ", baseSymbols[i]);
+         if(atrHandle != INVALID_HANDLE) IndicatorRelease(atrHandle);
+         if(emaHandle != INVALID_HANDLE) IndicatorRelease(emaHandle);
          continue;
       }
 
+      symbols[symbolCount].atrHandle = atrHandle;
+      symbols[symbolCount].emaHandle = emaHandle;
       symbolCount++;
    }
 
@@ -139,13 +173,14 @@ int OnInit()
 
    trade.SetExpertMagicNumber(MagicNumber);
    trade.SetDeviationInPoints(Slippage);
-   trade.SetTypeFilling(ORDER_FILLING_IOC);
 
    dailyStartBalance = AccountInfoDouble(ACCOUNT_BALANCE);
    dailyStartDate = TimeCurrent();
 
-   Print("=== DerivSMC_EA v1.2 Started ===");
-   Print("Symbols loaded: ", symbolCount);
+   Print("=== DerivSMC_EA v1.23 Started ===");
+   Print("Symbols loaded: ", symbolCount,
+         " | Structure=", UseMarketStructure,
+         " | M1 timing=", UseM1EntryTiming);
    for(int i=0; i<symbolCount; i++)
       Print("  → ", symbols[i].name, " | Risk: $", symbols[i].risk);
 
@@ -166,20 +201,26 @@ void OnDeinit(const int reason)
 //------------------- MAIN TICK --------------------------------------
 void OnTick()
 {
-   ManageOpenPositions();               // Trailing + Break-even first
+   ManageOpenPositions();
 
    if(!CheckDailyLossLimit()) return;
-   if(CountAllOpenPositions() >= MaxOpenTrades) return;
    if(UseNewsFilter && IsNewsTime()) return;
 
    for(int i = 0; i < symbolCount; i++)
    {
       string sym = symbols[i].name;
-
       if(!SymbolSelect(sym, true)) continue;
 
+      // Time a pending setup on each newly formed ExecTF (M1) bar
+      datetime execBar = iTime(sym, ExecTF, 0);
+      if(execBar != 0 && execBar != symbols[i].lastExecBar)
+      {
+         symbols[i].lastExecBar = execBar;
+         TryTimedEntry(i);
+      }
+
       datetime barTime = iTime(sym, EntryTF, 0);
-      if(barTime == symbols[i].lastBar) continue;
+      if(barTime == 0 || barTime == symbols[i].lastBar) continue;
       symbols[i].lastBar = barTime;
 
       if(symbols[i].cooldown > 0)
@@ -195,18 +236,101 @@ void OnTick()
       if(trend == 0)
       {
          symbols[i].cooldown = CooldownBars;
+         ClearPending(i);
          continue;
       }
 
-      int signal = 0;
+      if(UseMarketStructure)
+      {
+         int structure = GetMarketStructure(sym);
+         if(structure == 0 || structure != trend)
+         {
+            ClearPending(i);
+            continue; // skip this setup bar only, no long cooldown
+         }
+      }
 
+      int signal = 0;
       if(EnableCRT)            signal = DetectCRT(sym, trend);
       if(signal == 0 && EnableRejectionBlock) signal = DetectRejectionBlock(sym, trend);
       if(signal == 0 && EnableOrderBlock)     signal = DetectOrderBlock(sym, trend);
 
-      if(signal != 0 && CountPositionsOnSymbol(sym) == 0)
+      if(signal == 0)
+      {
+         ClearPending(i);
+         continue;
+      }
+
+      if(CountAllOpenPositions() >= MaxOpenTrades) continue;
+      if(CountPositionsOnSymbol(sym) != 0)
+      {
+         ClearPending(i);
+         continue;
+      }
+
+      if(!UseM1EntryTiming)
+      {
          OpenTrade(i, signal);
+         continue;
+      }
+
+      symbols[i].pendingSignal = signal;
+      symbols[i].pendingAgeM1  = 0;
+      Print(sym, " setup ", (signal == 1 ? "BUY" : "SELL"),
+            " on ", EnumToString(EntryTF),
+            " — waiting for ", EnumToString(ExecTF), " confirmation");
    }
+}
+
+void ClearPending(int idx)
+{
+   symbols[idx].pendingSignal = 0;
+   symbols[idx].pendingAgeM1  = 0;
+}
+
+void TryTimedEntry(int idx)
+{
+   if(symbols[idx].pendingSignal == 0) return;
+
+   symbols[idx].pendingAgeM1++;
+   if(symbols[idx].pendingAgeM1 > SetupExpireM1Bars)
+   {
+      Print(symbols[idx].name, " pending setup expired after ",
+            SetupExpireM1Bars, " ", EnumToString(ExecTF), " bars");
+      ClearPending(idx);
+      return;
+   }
+
+   if(CountAllOpenPositions() >= MaxOpenTrades) return;
+   if(CountPositionsOnSymbol(symbols[idx].name) != 0)
+   {
+      ClearPending(idx);
+      return;
+   }
+
+   // Confirm on the last closed ExecTF bar (shift 1), never the forming bar
+   if(!ExecBarConfirms(symbols[idx].name, symbols[idx].pendingSignal))
+      return;
+
+   int signal = symbols[idx].pendingSignal;
+   ClearPending(idx);
+   OpenTrade(idx, signal);
+}
+
+// Simple directional close that also takes the prior bar's high/low
+bool ExecBarConfirms(string sym, int signal)
+{
+   double open1  = iOpen(sym, ExecTF, 1);
+   double close1 = iClose(sym, ExecTF, 1);
+   double high2  = iHigh(sym, ExecTF, 2);
+   double low2   = iLow(sym, ExecTF, 2);
+   if(open1 <= 0 || close1 <= 0 || high2 <= 0 || low2 <= 0) return false;
+
+   if(signal == 1)
+      return (close1 > open1 && close1 > high2);
+   if(signal == -1)
+      return (close1 < open1 && close1 < low2);
+   return false;
 }
 
 //------------------- TREND FILTER -----------------------------------
@@ -221,6 +345,83 @@ int GetTrendDirection(int idx)
 
    if(close1 > ema[1] && close1 > close2) return 1;
    if(close1 < ema[1] && close1 < close2) return -1;
+   return 0;
+}
+
+//------------------- MARKET STRUCTURE (setup TF swings) -------------
+bool IsSwingHigh(string sym, int shift, int strength)
+{
+   double h = iHigh(sym, EntryTF, shift);
+   if(h <= 0) return false;
+   for(int i = 1; i <= strength; i++)
+   {
+      if(iHigh(sym, EntryTF, shift + i) >= h) return false;
+      if(iHigh(sym, EntryTF, shift - i) >= h) return false;
+   }
+   return true;
+}
+
+bool IsSwingLow(string sym, int shift, int strength)
+{
+   double l = iLow(sym, EntryTF, shift);
+   if(l <= 0) return false;
+   for(int i = 1; i <= strength; i++)
+   {
+      if(iLow(sym, EntryTF, shift + i) <= l) return false;
+      if(iLow(sym, EntryTF, shift - i) <= l) return false;
+   }
+   return true;
+}
+
+// 1 = HH or HL (bullish), -1 = LH or LL (bearish), 0 = unclear
+int GetMarketStructure(string sym)
+{
+   int strength = SwingStrength;
+   if(strength < 1) strength = 1;
+   int lookback = StructureLookback;
+   if(lookback < strength * 4 + 5) lookback = strength * 4 + 5;
+
+   double high1 = 0, high2 = 0, low1 = 0, low2 = 0;
+   datetime timeHigh1 = 0, timeLow1 = 0;
+   int highs = 0, lows = 0;
+
+   // Closed bars only: from 'strength' so the right side of the pivot is complete
+   for(int shift = strength; shift <= lookback; shift++)
+   {
+      if(highs < 2 && IsSwingHigh(sym, shift, strength))
+      {
+         double h = iHigh(sym, EntryTF, shift);
+         datetime t = iTime(sym, EntryTF, shift);
+         if(highs == 0) { high1 = h; timeHigh1 = t; }
+         else             high2 = h;
+         highs++;
+      }
+      if(lows < 2 && IsSwingLow(sym, shift, strength))
+      {
+         double l = iLow(sym, EntryTF, shift);
+         datetime t = iTime(sym, EntryTF, shift);
+         if(lows == 0) { low1 = l; timeLow1 = t; }
+         else            low2 = l;
+         lows++;
+      }
+      if(highs >= 2 && lows >= 2) break;
+   }
+
+   bool hh = (highs >= 2 && high1 > high2);
+   bool lh = (highs >= 2 && high1 < high2);
+   bool hl = (lows  >= 2 && low1  > low2);
+   bool ll = (lows  >= 2 && low1  < low2);
+
+   if((hh || hl) && !lh && !ll) return 1;
+   if((lh || ll) && !hh && !hl) return -1;
+
+   // Expanding or mixed range: use the most recent swing
+   if((hh || hl) && (lh || ll))
+   {
+      if(timeHigh1 >= timeLow1)
+         return (hh ? 1 : -1);
+      return (hl ? 1 : -1);
+   }
    return 0;
 }
 
@@ -269,6 +470,27 @@ int DetectOrderBlock(string sym, int trend)
    return 0;
 }
 
+//------------------- FILLING MODE -----------------------------------
+bool SetFillingForSymbol(string sym)
+{
+   uint mode = (uint)SymbolInfoInteger(sym, SYMBOL_FILLING_MODE);
+   if((mode & SYMBOL_FILLING_IOC) == SYMBOL_FILLING_IOC)
+      trade.SetTypeFilling(ORDER_FILLING_IOC);
+   else if((mode & SYMBOL_FILLING_FOK) == SYMBOL_FILLING_FOK)
+      trade.SetTypeFilling(ORDER_FILLING_FOK);
+   else
+      trade.SetTypeFilling(ORDER_FILLING_RETURN);
+   return true;
+}
+
+double MoneyToPriceDistance(string sym, double lot, double money)
+{
+   double tickSize  = SymbolInfoDouble(sym, SYMBOL_TRADE_TICK_SIZE);
+   double tickValue = SymbolInfoDouble(sym, SYMBOL_TRADE_TICK_VALUE);
+   if(tickSize <= 0 || tickValue <= 0 || lot <= 0) return 0;
+   return money * tickSize / (tickValue * lot);
+}
+
 //------------------- OPEN TRADE -------------------------------------
 void OpenTrade(int idx, int signal)
 {
@@ -285,31 +507,32 @@ void OpenTrade(int idx, int signal)
 
    double tickSize  = SymbolInfoDouble(sym, SYMBOL_TRADE_TICK_SIZE);
    double tickValue = SymbolInfoDouble(sym, SYMBOL_TRADE_TICK_VALUE);
-   double point     = SymbolInfoDouble(sym, SYMBOL_POINT);
+   if(tickValue <= 0 || tickSize <= 0) return;
 
-   if(tickValue <= 0 || point <= 0) return;
-
-   double slPoints = slDistance / point;
-   double lot = risk / (slPoints * tickValue / tickSize);
+   double lot = risk / ((slDistance / tickSize) * tickValue);
    lot = NormalizeLot(sym, lot);
-
    if(lot < SymbolInfoDouble(sym, SYMBOL_VOLUME_MIN)) return;
 
+   SetFillingForSymbol(sym);
+
    double price, sl, tp;
+   int digits = (int)SymbolInfoInteger(sym, SYMBOL_DIGITS);
 
    if(signal == 1)
    {
       price = SymbolInfoDouble(sym, SYMBOL_ASK);
-      sl = NormalizeDouble(price - slDistance, (int)SymbolInfoInteger(sym, SYMBOL_DIGITS));
-      tp = NormalizeDouble(price + tpDistance, (int)SymbolInfoInteger(sym, SYMBOL_DIGITS));
-      trade.Buy(lot, sym, price, sl, tp, "SMC Buy");
+      sl = NormalizeDouble(price - slDistance, digits);
+      tp = NormalizeDouble(price + tpDistance, digits);
+      if(trade.Buy(lot, sym, price, sl, tp, "SMC Buy"))
+         Print(sym, " market BUY lot ", lot);
    }
    else
    {
       price = SymbolInfoDouble(sym, SYMBOL_BID);
-      sl = NormalizeDouble(price + slDistance, (int)SymbolInfoInteger(sym, SYMBOL_DIGITS));
-      tp = NormalizeDouble(price - tpDistance, (int)SymbolInfoInteger(sym, SYMBOL_DIGITS));
-      trade.Sell(lot, sym, price, sl, tp, "SMC Sell");
+      sl = NormalizeDouble(price + slDistance, digits);
+      tp = NormalizeDouble(price - tpDistance, digits);
+      if(trade.Sell(lot, sym, price, sl, tp, "SMC Sell"))
+         Print(sym, " market SELL lot ", lot);
    }
 }
 
@@ -318,7 +541,8 @@ void ManageOpenPositions()
 {
    for(int i = PositionsTotal() - 1; i >= 0; i--)
    {
-      if(!PositionSelectByTicket(PositionGetTicket(i))) continue;
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0 || !PositionSelectByTicket(ticket)) continue;
       if(PositionGetInteger(POSITION_MAGIC) != MagicNumber) continue;
 
       string sym = PositionGetString(POSITION_SYMBOL);
@@ -327,43 +551,55 @@ void ManageOpenPositions()
       double currentTP = PositionGetDouble(POSITION_TP);
       long   type = PositionGetInteger(POSITION_TYPE);
       double profit = PositionGetDouble(POSITION_PROFIT);
+      double lot = PositionGetDouble(POSITION_VOLUME);
 
       double bid = SymbolInfoDouble(sym, SYMBOL_BID);
       double ask = SymbolInfoDouble(sym, SYMBOL_ASK);
       int digits = (int)SymbolInfoInteger(sym, SYMBOL_DIGITS);
 
-      // --- Break-even ---
       if(UseBreakEven && profit >= BreakEvenTrigger)
       {
-         double bePrice;
-         if(type == POSITION_TYPE_BUY)
+         double beOffset = MoneyToPriceDistance(sym, lot, BreakEvenProfit);
+         if(beOffset > 0)
          {
-            bePrice = NormalizeDouble(openPrice + BreakEvenProfit, digits);
-            if(currentSL < bePrice)
-               trade.PositionModify(PositionGetTicket(i), bePrice, currentTP);
-         }
-         else
-         {
-            bePrice = NormalizeDouble(openPrice - BreakEvenProfit, digits);
-            if(currentSL > bePrice || currentSL == 0)
-               trade.PositionModify(PositionGetTicket(i), bePrice, currentTP);
+            if(type == POSITION_TYPE_BUY)
+            {
+               double bePrice = NormalizeDouble(openPrice + beOffset, digits);
+               if(currentSL < bePrice && bePrice < bid)
+               {
+                  if(trade.PositionModify(ticket, bePrice, currentTP))
+                     currentSL = bePrice;
+               }
+            }
+            else
+            {
+               double bePrice = NormalizeDouble(openPrice - beOffset, digits);
+               if((currentSL > bePrice || currentSL == 0) && bePrice > ask)
+               {
+                  if(trade.PositionModify(ticket, bePrice, currentTP))
+                     currentSL = bePrice;
+               }
+            }
          }
       }
 
-      // --- Trailing Stop ---
       if(UseTrailingStop && profit >= TrailingStart)
       {
-         if(type == POSITION_TYPE_BUY)
+         double trailDist = MoneyToPriceDistance(sym, lot, TrailingStep);
+         if(trailDist > 0)
          {
-            double newSL = NormalizeDouble(bid - TrailingStep, digits);
-            if(newSL > currentSL && newSL < bid)
-               trade.PositionModify(PositionGetTicket(i), newSL, currentTP);
-         }
-         else
-         {
-            double newSL = NormalizeDouble(ask + TrailingStep, digits);
-            if((newSL < currentSL || currentSL == 0) && newSL > ask)
-               trade.PositionModify(PositionGetTicket(i), newSL, currentTP);
+            if(type == POSITION_TYPE_BUY)
+            {
+               double newSL = NormalizeDouble(bid - trailDist, digits);
+               if(newSL > currentSL && newSL < bid)
+                  trade.PositionModify(ticket, newSL, currentTP);
+            }
+            else
+            {
+               double newSL = NormalizeDouble(ask + trailDist, digits);
+               if((newSL < currentSL || currentSL == 0) && newSL > ask)
+                  trade.PositionModify(ticket, newSL, currentTP);
+            }
          }
       }
    }
@@ -376,8 +612,9 @@ double NormalizeLot(string sym, double lot)
    double maxLot = SymbolInfoDouble(sym, SYMBOL_VOLUME_MAX);
    double step   = SymbolInfoDouble(sym, SYMBOL_VOLUME_STEP);
 
+   if(step <= 0) return 0;
    lot = MathFloor(lot / step) * step;
-   if(lot < minLot) lot = minLot;
+   if(lot < minLot) return 0;
    if(lot > maxLot) lot = maxLot;
    return NormalizeDouble(lot, 2);
 }
@@ -387,7 +624,9 @@ int CountPositionsOnSymbol(string sym)
    int count = 0;
    for(int i = PositionsTotal()-1; i >= 0; i--)
    {
-      if(PositionGetSymbol(i) == sym && PositionGetInteger(POSITION_MAGIC) == MagicNumber)
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0 || !PositionSelectByTicket(ticket)) continue;
+      if(PositionGetString(POSITION_SYMBOL) == sym && PositionGetInteger(POSITION_MAGIC) == MagicNumber)
          count++;
    }
    return count;
@@ -398,6 +637,8 @@ int CountAllOpenPositions()
    int count = 0;
    for(int i = PositionsTotal()-1; i >= 0; i--)
    {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0 || !PositionSelectByTicket(ticket)) continue;
       if(PositionGetInteger(POSITION_MAGIC) == MagicNumber)
          count++;
    }
@@ -416,6 +657,8 @@ bool CheckDailyLossLimit()
       dailyStartDate = TimeCurrent();
    }
 
+   if(dailyStartBalance <= 0) return true;
+
    double loss = (dailyStartBalance - AccountInfoDouble(ACCOUNT_BALANCE)) / dailyStartBalance * 100.0;
    if(loss >= DailyLossLimitPercent)
    {
@@ -427,8 +670,6 @@ bool CheckDailyLossLimit()
 
 bool IsNewsTime()
 {
-   // Simple placeholder - can be expanded with economic calendar later
-   // For now returns false when filter is enabled (safe default)
    return false;
 }
 //+------------------------------------------------------------------+
