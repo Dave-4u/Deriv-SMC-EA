@@ -1,71 +1,70 @@
-# Deriv-SMC-EA (Multi-Pair)
+# Deriv-SMC-EA v1.2
 
-**MT5 Expert Advisor for Deriv Synthetic Indices**  
-Strategies: CRT → Rejection Block → Order Block  
-with mandatory H1 Trend Filter.
+**Multi-Pair MT5 Expert Advisor**  
+Strategies: **CRT → Rejection Block → Order Block**  
+with H1 Trend Filter
 
-Now supports **multiple pairs** from a single chart.
-
----
-
-## Key Features
-
-- Multi-pair scanner (you choose which symbols)
-- Fixed dollar risk (default **$3** per trade — easy to change)
-- Max open trades across all pairs: **10**
-- H1 Trend Filter + M5 setups
-- Priority: CRT > Rejection Block > Order Block
-- Daily loss protection still active
+### New in v1.2
+- Fixed compilation error (`iATR`)
+- **Trailing Stop**
+- **Break-even** feature
+- **Optional News Filter**
+- Ability to set **different risk per pair**
+- Works on **Deriv Synthetics + Gold + Forex pairs**
 
 ---
 
-## How to Use (Updated)
+## Quick Setup
 
-### 1. Install
-Same as before:
-1. Download the latest `DerivSMC_EA.mq5`
+1. Download latest `DerivSMC_EA.mq5`
 2. Put it in `MQL5/Experts`
-3. Restart MT5 / Refresh Navigator
-
-### 2. Attach to ONE chart only
-- Open any Synthetic chart (e.g. Volatility 75) on **M5**
-- Drag the EA onto that chart
-- You only need **one** chart running
-
-### 3. Important Inputs (new ones)
-
-| Input                  | Default Value                          | Meaning                              |
-|------------------------|----------------------------------------|--------------------------------------|
-| **Symbols**            | Volatility 75 Index,Volatility 100 Index,Boom 1000 Index,Crash 500 Index | List of pairs (comma separated)     |
-| **RiskMoney**          | 3.0                                    | Maximum $ you want to risk per trade |
-| **MaxOpenTrades**      | 10                                     | Maximum total open positions         |
-| RiskPercent            | (disabled)                             | No longer used                       |
-| DailyLossLimitPercent  | 3.0                                    | Still active                         |
-
-**How to edit the pairs list:**
-Just type the exact symbol names separated by commas (no spaces after comma is safer):
-```
-Volatility 75 Index,Volatility 100 Index,Boom 1000 Index,Crash 500 Index,Volatility 25 Index
-```
-
-### 4. Recommended Starting Symbols
-- Volatility 75 Index
-- Volatility 100 Index
-- Boom 1000 Index
-- Crash 500 Index
-- Crash 1000 Index
-- Volatility 50 Index
+3. Compile (F7) — should show **0 errors**
+4. Attach to **one** M5 chart only
+5. Fill the symbols list and set your risk
 
 ---
 
-## Risk Notes (Small Account)
+## Important Inputs
 
-- Default risk is **$3** per trade
-- You can change `RiskMoney` anytime in the inputs
-- Max 10 open trades total across all pairs
-- Daily loss limit still protects you
+### Multi-Pair & Risk
+```
+SymbolsList          = Volatility 75 Index,Volatility 100 Index,Boom 1000 Index,Crash 500 Index,XAUUSD
+RiskMoney            = 3.0          // Default risk in $
+MaxOpenTrades        = 10
+```
+
+You can also set individual risk using the format:
+```
+Symbol:Risk,Symbol:Risk
+Example: Volatility 75 Index:3,XAUUSD:5,Boom 1000 Index:2.5
+```
+
+### Trailing & Break-even
+```
+UseTrailingStop      = true
+TrailingStart        = 1.0          // Start trailing after $1 profit
+TrailingStep         = 0.5          // Trail by $0.5
+
+UseBreakEven         = true
+BreakEvenTrigger     = 1.5          // Move SL to BE after $1.5 profit
+BreakEvenProfit      = 0.2          // Lock $0.2 profit
+```
+
+### News Filter (Optional)
+```
+UseNewsFilter        = false        // Set to true if you want it
+NewsMinutesBefore    = 30
+NewsMinutesAfter     = 30
+```
 
 ---
 
-## Disclaimer
-Trading involves risk. This EA is for educational purposes. Always test on Demo first.
+## Supported Markets
+- All Deriv Synthetic Indices
+- Gold (XAUUSD)
+- Forex pairs (EURUSD, GBPUSD, etc.)
+- Most CFD symbols on Deriv MT5
+
+---
+
+**Repository**: https://github.com/Dave-4u/Deriv-SMC-EA
