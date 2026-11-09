@@ -1,22 +1,26 @@
 //+------------------------------------------------------------------+
 //|                                                  DerivSMC_EA.mq5 |
-//|                        Order Block + Rejection Block + CRT       |
-//|                     with H1 Trend Filter (Small Account Ready)   |
+//|     Multi-Pair Scanner | CRT + Rejection Block + Order Block     |
+//|              H1 Trend Filter | Fixed $ Risk | Max 10 Trades      |
 //+------------------------------------------------------------------+
-#property copyright "Dave-4u / Grok"
+#property copyright "Dave-4u"
 #property link      "https://github.com/Dave-4u/Deriv-SMC-EA"
-#property version   "1.00"
+#property version   "1.10"
 #property strict
 
 #include <Trade\Trade.mqh>
 CTrade trade;
 
 //------------------- INPUTS ----------------------------------------
-input group "=== Risk Management (Small Account) ==="
-input double   RiskPercent           = 0.75;    // Risk per trade (% of balance)
+input group "=== MULTI-PAIR SETTINGS ==="
+input string   SymbolsList           = "Volatility 75 Index,Volatility 100 Index,Boom 1000 Index,Crash 500 Index"; // Comma-separated symbols
+input double   RiskMoney             = 3.0;     // Risk per trade in $ (e.g. 3.0 = $3)
+input int      MaxOpenTrades         = 10;      // Max total open positions across all pairs
+
+input group "=== Risk & Protection ==="
 input double   DailyLossLimitPercent = 3.0;     // Max daily loss %
 input int      MagicNumber           = 20261109;
-input int      MaxSpreadPoints       = 80;      // Max allowed spread
+input int      MaxSpreadPoints       = 100;
 
 input group "=== Strategy Switches ==="
 input bool     EnableCRT             = true;
@@ -24,232 +28,250 @@ input bool     EnableRejectionBlock  = true;
 input bool     EnableOrderBlock      = true;
 
 input group "=== Timeframes ==="
-input ENUM_TIMEFRAMES TrendTF        = PERIOD_H1;  // Trend filter timeframe
-input ENUM_TIMEFRAMES EntryTF        = PERIOD_M5;  // Setup timeframe
+input ENUM_TIMEFRAMES TrendTF        = PERIOD_H1;
+input ENUM_TIMEFRAMES EntryTF        = PERIOD_M5;
 
 input group "=== Trend Filter ==="
-input int      EMA_Period            = 50;         // EMA period for trend
-input int      CooldownBars          = 12;         // Bars to skip when misaligned
+input int      EMA_Period            = 50;
+input int      CooldownBars          = 12;
 
 input group "=== Trade Management ==="
-input double   RR_Ratio              = 2.0;        // Risk : Reward
+input double   RR_Ratio              = 2.0;     // Risk:Reward
 input int      Slippage              = 30;
 
 //------------------- GLOBALS ----------------------------------------
-datetime lastBarTime = 0;
-int      cooldownCounter = 0;
+string   symbols[];
+int      symbolCount = 0;
+datetime lastBarTime[];
+int      cooldownCounter[];
 double   dailyStartBalance = 0;
 datetime dailyStartDate = 0;
 
 //------------------- INITIALIZATION ---------------------------------
 int OnInit()
 {
+   // Parse symbols list
+   string temp = SymbolsList;
+   StringReplace(temp, " ", "");          // remove spaces
+   StringSplit(temp, ',', symbols);
+   symbolCount = ArraySize(symbols);
+
+   if(symbolCount == 0)
+   {
+      Print("ERROR: No symbols provided!");
+      return(INIT_FAILED);
+   }
+
+   ArrayResize(lastBarTime, symbolCount);
+   ArrayResize(cooldownCounter, symbolCount);
+   ArrayInitialize(lastBarTime, 0);
+   ArrayInitialize(cooldownCounter, 0);
+
    trade.SetExpertMagicNumber(MagicNumber);
    trade.SetDeviationInPoints(Slippage);
    trade.SetTypeFilling(ORDER_FILLING_IOC);
-   
+
    dailyStartBalance = AccountInfoDouble(ACCOUNT_BALANCE);
    dailyStartDate = TimeCurrent();
-   
-   Print("DerivSMC_EA initialized | Risk: ", RiskPercent, "% | Magic: ", MagicNumber);
+
+   Print("DerivSMC_EA Multi-Pair started | Symbols: ", symbolCount, " | Risk: $", RiskMoney, " | MaxTrades: ", MaxOpenTrades);
+   for(int i=0; i<symbolCount; i++)
+      Print("  → ", symbols[i]);
+
    return(INIT_SUCCEEDED);
 }
 
 //------------------- MAIN LOGIC -------------------------------------
 void OnTick()
 {
-   // New bar check on EntryTF
-   datetime currentBar = iTime(_Symbol, EntryTF, 0);
-   if(currentBar == lastBarTime) return;
-   lastBarTime = currentBar;
-
-   // Daily loss protection
    if(!CheckDailyLossLimit()) return;
+   if(CountAllOpenPositions() >= MaxOpenTrades) return;
 
-   // Cooldown
-   if(cooldownCounter > 0)
+   for(int i = 0; i < symbolCount; i++)
    {
-      cooldownCounter--;
-      return;
-   }
+      string sym = symbols[i];
 
-   // Spread filter
-   if(SymbolInfoInteger(_Symbol, SYMBOL_SPREAD) > MaxSpreadPoints) return;
+      // Check if symbol is available
+      if(!SymbolSelect(sym, true)) continue;
 
-   // === TREND FILTER ===
-   int trend = GetTrendDirection();   // 1 = Bullish, -1 = Bearish, 0 = Neutral
-   if(trend == 0) return;
+      // New bar check
+      datetime barTime = iTime(sym, EntryTF, 0);
+      if(barTime == lastBarTime[i]) continue;
+      lastBarTime[i] = barTime;
 
-   // === SCAN SETUPS (Priority order) ===
-   int signal = 0;   // 1 = Buy, -1 = Sell
+      // Cooldown
+      if(cooldownCounter[i] > 0)
+      {
+         cooldownCounter[i]--;
+         continue;
+      }
 
-   if(EnableCRT)
-      signal = DetectCRT(trend);
+      // Spread filter
+      long spread = SymbolInfoInteger(sym, SYMBOL_SPREAD);
+      if(spread > MaxSpreadPoints) continue;
 
-   if(signal == 0 && EnableRejectionBlock)
-      signal = DetectRejectionBlock(trend);
+      // Trend filter
+      int trend = GetTrendDirection(sym);
+      if(trend == 0)
+      {
+         cooldownCounter[i] = CooldownBars;
+         continue;
+      }
 
-   if(signal == 0 && EnableOrderBlock)
-      signal = DetectOrderBlock(trend);
+      // Detect setups
+      int signal = 0;
 
-   // Execute if we have a valid aligned signal
-   if(signal != 0)
-   {
-      if(CountOpenPositions() == 0)   // only one position at a time for small accounts
-         OpenTrade(signal);
+      if(EnableCRT)
+         signal = DetectCRT(sym, trend);
+
+      if(signal == 0 && EnableRejectionBlock)
+         signal = DetectRejectionBlock(sym, trend);
+
+      if(signal == 0 && EnableOrderBlock)
+         signal = DetectOrderBlock(sym, trend);
+
+      if(signal != 0)
+      {
+         // Only one position per symbol
+         if(CountPositionsOnSymbol(sym) == 0)
+            OpenTrade(sym, signal);
+      }
    }
 }
 
-//------------------- TREND FILTER (H1) -------------------------------
-int GetTrendDirection()
+//------------------- TREND FILTER -----------------------------------
+int GetTrendDirection(string sym)
 {
    double ema[];
    ArraySetAsSeries(ema, true);
-   int handle = iMA(_Symbol, TrendTF, EMA_Period, 0, MODE_EMA, PRICE_CLOSE);
+   int handle = iMA(sym, TrendTF, EMA_Period, 0, MODE_EMA, PRICE_CLOSE);
+   if(handle == INVALID_HANDLE) return 0;
    if(CopyBuffer(handle, 0, 0, 3, ema) < 3) return 0;
 
-   double close1 = iClose(_Symbol, TrendTF, 1);
-   double close2 = iClose(_Symbol, TrendTF, 2);
+   double close1 = iClose(sym, TrendTF, 1);
+   double close2 = iClose(sym, TrendTF, 2);
 
-   // Simple structure + EMA
    bool bullishStructure = close1 > close2;
    bool bearishStructure = close1 < close2;
 
-   if(close1 > ema[1] && bullishStructure) return 1;   // Bullish
-   if(close1 < ema[1] && bearishStructure) return -1;  // Bearish
-
-   return 0; // Neutral
-}
-
-//------------------- CRT DETECTION ----------------------------------
-int DetectCRT(int trend)
-{
-   // Candle 1 = range, Candle 2 = sweep, we act on close of candle 2
-   double high1 = iHigh(_Symbol, EntryTF, 2);
-   double low1  = iLow(_Symbol, EntryTF, 2);
-   double high2 = iHigh(_Symbol, EntryTF, 1);
-   double low2  = iLow(_Symbol, EntryTF, 1);
-   double close2= iClose(_Symbol, EntryTF, 1);
-
-   // Bullish CRT: swept low of candle 1 and closed back inside
-   if(trend == 1 && low2 < low1 && close2 > low1 && close2 < high1)
-   {
-      Print("CRT Bullish detected");
-      return 1;
-   }
-
-   // Bearish CRT: swept high of candle 1 and closed back inside
-   if(trend == -1 && high2 > high1 && close2 < high1 && close2 > low1)
-   {
-      Print("CRT Bearish detected");
-      return -1;
-   }
+   if(close1 > ema[1] && bullishStructure) return 1;
+   if(close1 < ema[1] && bearishStructure) return -1;
 
    return 0;
 }
 
-//------------------- REJECTION BLOCK DETECTION ----------------------
-int DetectRejectionBlock(int trend)
+//------------------- CRT --------------------------------------------
+int DetectCRT(string sym, int trend)
 {
-   double open1  = iOpen(_Symbol, EntryTF, 1);
-   double close1 = iClose(_Symbol, EntryTF, 1);
-   double high1  = iHigh(_Symbol, EntryTF, 1);
-   double low1   = iLow(_Symbol, EntryTF, 1);
+   double high1 = iHigh(sym, EntryTF, 2);
+   double low1  = iLow(sym, EntryTF, 2);
+   double high2 = iHigh(sym, EntryTF, 1);
+   double low2  = iLow(sym, EntryTF, 1);
+   double close2= iClose(sym, EntryTF, 1);
+
+   if(trend == 1 && low2 < low1 && close2 > low1 && close2 < high1)
+   {
+      Print(sym, " | CRT Bullish");
+      return 1;
+   }
+   if(trend == -1 && high2 > high1 && close2 < high1 && close2 > low1)
+   {
+      Print(sym, " | CRT Bearish");
+      return -1;
+   }
+   return 0;
+}
+
+//------------------- REJECTION BLOCK --------------------------------
+int DetectRejectionBlock(string sym, int trend)
+{
+   double open1  = iOpen(sym, EntryTF, 1);
+   double close1 = iClose(sym, EntryTF, 1);
+   double high1  = iHigh(sym, EntryTF, 1);
+   double low1   = iLow(sym, EntryTF, 1);
 
    double body = MathAbs(close1 - open1);
    double upperWick = high1 - MathMax(open1, close1);
    double lowerWick = MathMin(open1, close1) - low1;
 
-   // Bullish Rejection (long lower wick)
    if(trend == 1 && lowerWick > body * 1.5 && lowerWick > upperWick)
    {
-      Print("Rejection Block Bullish detected");
+      Print(sym, " | Rejection Block Bullish");
       return 1;
    }
-
-   // Bearish Rejection (long upper wick)
    if(trend == -1 && upperWick > body * 1.5 && upperWick > lowerWick)
    {
-      Print("Rejection Block Bearish detected");
+      Print(sym, " | Rejection Block Bearish");
       return -1;
    }
-
    return 0;
 }
 
-//------------------- ORDER BLOCK DETECTION (Simplified) -------------
-int DetectOrderBlock(int trend)
+//------------------- ORDER BLOCK (Simplified) -----------------------
+int DetectOrderBlock(string sym, int trend)
 {
-   // Very simplified version for reliability on synthetics
-   // Looks for last opposing candle before strong move
+   double close1 = iClose(sym, EntryTF, 1);
+   double close2 = iClose(sym, EntryTF, 2);
+   double close3 = iClose(sym, EntryTF, 3);
 
-   double close1 = iClose(_Symbol, EntryTF, 1);
-   double close2 = iClose(_Symbol, EntryTF, 2);
-   double close3 = iClose(_Symbol, EntryTF, 3);
-
-   // Bullish OB approximation: strong up move after down candle
    if(trend == 1 && close2 < close3 && close1 > close2 && (close1 - close2) > (close3 - close2) * 1.2)
    {
-      Print("Order Block Bullish detected");
+      Print(sym, " | Order Block Bullish");
       return 1;
    }
-
-   // Bearish OB approximation
    if(trend == -1 && close2 > close3 && close1 < close2 && (close2 - close1) > (close2 - close3) * 1.2)
    {
-      Print("Order Block Bearish detected");
+      Print(sym, " | Order Block Bearish");
       return -1;
    }
-
    return 0;
 }
 
-//------------------- TRADE EXECUTION --------------------------------
-void OpenTrade(int signal)
+//------------------- OPEN TRADE -------------------------------------
+void OpenTrade(string sym, int signal)
 {
-   double balance = AccountInfoDouble(ACCOUNT_BALANCE);
-   double riskMoney = balance * RiskPercent / 100.0;
-
-   double atr = iATR(_Symbol, EntryTF, 14, 1);
+   double atr = iATR(sym, EntryTF, 14, 1);
    if(atr <= 0) return;
 
-   double slDistance = atr * 1.5;          // SL = 1.5 ATR
+   double slDistance = atr * 1.5;
    double tpDistance = slDistance * RR_Ratio;
 
-   double tickSize = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
-   double tickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
-   double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   double tickSize  = SymbolInfoDouble(sym, SYMBOL_TRADE_TICK_SIZE);
+   double tickValue = SymbolInfoDouble(sym, SYMBOL_TRADE_TICK_VALUE);
+   double point     = SymbolInfoDouble(sym, SYMBOL_POINT);
+
+   if(tickValue <= 0 || point <= 0) return;
 
    double slPoints = slDistance / point;
-   double lot = riskMoney / (slPoints * tickValue / tickSize);
-   lot = NormalizeLot(lot);
+   double lot = RiskMoney / (slPoints * tickValue / tickSize);
+   lot = NormalizeLot(sym, lot);
 
-   if(lot < SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN)) return;
+   if(lot < SymbolInfoDouble(sym, SYMBOL_VOLUME_MIN)) return;
 
    double price, sl, tp;
 
-   if(signal == 1) // Buy
+   if(signal == 1)
    {
-      price = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+      price = SymbolInfoDouble(sym, SYMBOL_ASK);
       sl = price - slDistance;
       tp = price + tpDistance;
-      trade.Buy(lot, _Symbol, price, sl, tp, "SMC Buy");
+      trade.Buy(lot, sym, price, sl, tp, "SMC Buy");
    }
-   else // Sell
+   else
    {
-      price = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+      price = SymbolInfoDouble(sym, SYMBOL_BID);
       sl = price + slDistance;
       tp = price - tpDistance;
-      trade.Sell(lot, _Symbol, price, sl, tp, "SMC Sell");
+      trade.Sell(lot, sym, price, sl, tp, "SMC Sell");
    }
 }
 
 //------------------- HELPERS ----------------------------------------
-double NormalizeLot(double lot)
+double NormalizeLot(string sym, double lot)
 {
-   double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
-   double maxLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
-   double step   = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+   double minLot = SymbolInfoDouble(sym, SYMBOL_VOLUME_MIN);
+   double maxLot = SymbolInfoDouble(sym, SYMBOL_VOLUME_MAX);
+   double step   = SymbolInfoDouble(sym, SYMBOL_VOLUME_STEP);
 
    lot = MathFloor(lot / step) * step;
    if(lot < minLot) lot = minLot;
@@ -257,12 +279,23 @@ double NormalizeLot(double lot)
    return NormalizeDouble(lot, 2);
 }
 
-int CountOpenPositions()
+int CountPositionsOnSymbol(string sym)
 {
    int count = 0;
    for(int i = PositionsTotal() - 1; i >= 0; i--)
    {
-      if(PositionGetSymbol(i) == _Symbol && PositionGetInteger(POSITION_MAGIC) == MagicNumber)
+      if(PositionGetSymbol(i) == sym && PositionGetInteger(POSITION_MAGIC) == MagicNumber)
+         count++;
+   }
+   return count;
+}
+
+int CountAllOpenPositions()
+{
+   int count = 0;
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      if(PositionGetInteger(POSITION_MAGIC) == MagicNumber)
          count++;
    }
    return count;
@@ -285,7 +318,7 @@ bool CheckDailyLossLimit()
 
    if(lossPercent >= DailyLossLimitPercent)
    {
-      Print("Daily loss limit reached. Trading paused until tomorrow.");
+      Print("Daily loss limit reached. Trading paused.");
       return false;
    }
    return true;
@@ -293,6 +326,6 @@ bool CheckDailyLossLimit()
 
 void OnDeinit(const int reason)
 {
-   Print("DerivSMC_EA removed");
+   Print("DerivSMC_EA Multi-Pair removed");
 }
 //+------------------------------------------------------------------+
