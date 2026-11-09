@@ -2,11 +2,11 @@
 //|                                                  DerivSMC_EA.mq5 |
 //|  Multi-Pair | CRT + Rejection + OrderBlock | Trailing + BE       |
 //|  Works on Synthetics + Gold + Forex | Fixed $ Risk               |
-//|  v1.23: market structure on setup TF, M1 market-entry timing     |
+//|  v1.24: symbols from MQL5\\Files .txt; structure + M1 entry     |
 //+------------------------------------------------------------------+
 #property copyright "Dave-4u"
 #property link      "https://github.com/Dave-4u/Deriv-SMC-EA"
-#property version   "1.23"
+#property version   "1.24"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -15,6 +15,8 @@ CTrade trade;
 //------------------- INPUTS ----------------------------------------
 input group "=== MULTI-PAIR & RISK ==="
 input string   SymbolsList           = "Volatility 75 Index,Volatility 100 Index,Boom 1000 Index,Crash 500 Index,XAUUSD";
+input bool     SymbolsFromFile       = true;       // Read names from a .txt in MQL5\\Files
+input string   SymbolsFile           = "DaveSymbols.txt"; // one name per line or comma-separated, # = comment
 input double   RiskMoney             = 3.0;        // Default risk in $
 input int      MaxOpenTrades         = 10;
 input string   CustomRiskList        = "";         // Optional: Symbol:Risk,Symbol:Risk (e.g. XAUUSD:5,Volatility 75 Index:2.5)
@@ -83,16 +85,96 @@ int        symbolCount = 0;
 double     dailyStartBalance = 0;
 datetime   dailyStartDate = 0;
 
+
+//------------------- SYMBOL FILE (MQL5\Files) -----------------------
+void SymAddTokens(string line, string &out[])
+{
+   StringReplace(line, "\r", "");
+   StringTrimLeft(line);
+   StringTrimRight(line);
+   if(StringLen(line) == 0 || StringGetCharacter(line, 0) == '#') return;
+   string parts[];
+   int k = StringSplit(line, ',', parts);
+   for(int i = 0; i < k; i++)
+   {
+      string t = parts[i];
+      StringTrimLeft(t);
+      StringTrimRight(t);
+      if(StringLen(t) == 0) continue;
+      int sz = ArraySize(out);
+      ArrayResize(out, sz + 1);
+      out[sz] = t;
+   }
+}
+
+int LoadSymbolsFile(string fname, string &out[])
+{
+   ArrayResize(out, 0);
+   int h = FileOpen(fname, FILE_READ | FILE_BIN);
+   if(h == INVALID_HANDLE)
+   {
+      Print("SYMBOLS cannot open ", fname, " err=", GetLastError());
+      return 0;
+   }
+   uchar raw[];
+   int len = (int)FileSize(h);
+   if(len > 0) FileReadArray(h, raw, 0, len);
+   FileClose(h);
+   len = ArraySize(raw);
+   if(len == 0) return 0;
+
+   string text = "";
+   if(len >= 2 && raw[0] == 0xFF && raw[1] == 0xFE)            // UTF-16 LE
+   {
+      for(int i = 2; i + 1 < len; i += 2)
+      {
+         ushort c = (ushort)(raw[i] | (raw[i + 1] << 8));
+         text += ShortToString(c);
+      }
+   }
+   else if(len >= 2 && raw[0] == 0xFE && raw[1] == 0xFF)       // UTF-16 BE
+   {
+      for(int i = 2; i + 1 < len; i += 2)
+      {
+         ushort c = (ushort)((raw[i] << 8) | raw[i + 1]);
+         text += ShortToString(c);
+      }
+   }
+   else
+   {
+      int start = (len >= 3 && raw[0] == 0xEF && raw[1] == 0xBB && raw[2] == 0xBF) ? 3 : 0;
+      text = CharArrayToString(raw, start, len - start, CP_UTF8);
+   }
+
+   string lines[];
+   int nl = StringSplit(text, '\n', lines);
+   for(int i = 0; i < nl; i++)
+      SymAddTokens(lines[i], out);
+   return ArraySize(out);
+}
+
 //------------------- INITIALIZATION ---------------------------------
 int OnInit()
 {
-   // Parse main symbols list (keep spaces inside names; trim only around commas)
+   // Load symbols from MQL5\Files .txt when enabled; keep spaces in names
    string baseSymbols[];
-   int baseCount = StringSplit(SymbolsList, ',', baseSymbols);
-   for(int i = 0; i < baseCount; i++)
+   int baseCount = 0;
+   if(SymbolsFromFile && StringLen(SymbolsFile) > 0)
    {
-      StringTrimLeft(baseSymbols[i]);
-      StringTrimRight(baseSymbols[i]);
+      baseCount = LoadSymbolsFile(SymbolsFile, baseSymbols);
+      if(baseCount > 0)
+         Print("SYMBOLS from file ", SymbolsFile, ": ", baseCount, " names");
+      else
+         Print("SYMBOLS file ", SymbolsFile, " missing/empty (put it in MQL5\\Files) - falling back to SymbolsList");
+   }
+   if(baseCount <= 0)
+   {
+      baseCount = StringSplit(SymbolsList, ',', baseSymbols);
+      for(int i = 0; i < baseCount; i++)
+      {
+         StringTrimLeft(baseSymbols[i]);
+         StringTrimRight(baseSymbols[i]);
+      }
    }
 
    string customPairs[];
@@ -177,8 +259,9 @@ int OnInit()
    dailyStartBalance = AccountInfoDouble(ACCOUNT_BALANCE);
    dailyStartDate = TimeCurrent();
 
-   Print("=== DerivSMC_EA v1.23 Started ===");
+   Print("=== DerivSMC_EA v1.24 Started ===");
    Print("Symbols loaded: ", symbolCount,
+         " | from file=", (SymbolsFromFile ? SymbolsFile : "SymbolsList"),
          " | Structure=", UseMarketStructure,
          " | M1 timing=", UseM1EntryTiming);
    for(int i=0; i<symbolCount; i++)

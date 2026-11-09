@@ -1,10 +1,13 @@
-# Deriv-SMC-EA v1.23
+# Deriv-SMC-EA v1.24
 
 **Multi-Pair MT5 Expert Advisor**  
 Strategies: **CRT → Rejection Block → Order Block**  
 with an H1 trend filter, setup-timeframe market structure, and 1-minute market-entry timing.
 
-### New in v1.23
+### New in v1.24
+- Reads a symbols `.txt` from `MQL5\Files` (default `DaveSymbols.txt`: one name per line or comma-separated, `#` comments). Falls back to SymbolsList if the file is missing or empty.
+
+### Also in v1.23
 - Keeps spaces in symbol names (`Volatility 75 Index` no longer becomes `Volatility75Index`)
 - MQL5-safe position counting (max-open and one-per-symbol checks)
 - Lot size is not rounded up past your `$` risk; the trade is skipped if min lot would exceed it
@@ -39,6 +42,14 @@ You can also set individual risk using the format:
 Symbol:Risk,Symbol:Risk
 Example: Volatility 75 Index:3,XAUUSD:5,Boom 1000 Index:2.5
 ```
+
+### Symbols file
+```
+SymbolsFromFile      = true         // Read names from a .txt in MQL5\Files
+SymbolsFile          = DaveSymbols.txt
+```
+
+Put `DaveSymbols.txt` in the terminal's `MQL5\Files` folder (same file your other EA uses is fine). One symbol per line, or comma-separated; lines starting with `#` are ignored. The list is loaded only when the EA starts, so after you edit the file, remove it from the chart and attach it again. If the file is missing or empty, the bot uses `SymbolsList` instead.
 
 ### Timeframes, structure, and M1 timing
 ```
