@@ -2,11 +2,11 @@
 //|                                                  DerivSMC_EA.mq5 |
 //|  Multi-Pair | CRT + Rejection + OrderBlock | Trailing + BE       |
 //|  Works on Synthetics + Gold + Forex | Fixed $ Risk               |
-//|  v1.24: symbols from MQL5\\Files .txt; structure + M1 entry     |
+//|  v1.25: broker stop levels respected; trailing modify throttle  |
 //+------------------------------------------------------------------+
 #property copyright "Dave-4u"
 #property link      "https://github.com/Dave-4u/Deriv-SMC-EA"
-#property version   "1.24"
+#property version   "1.25"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -61,6 +61,14 @@ input bool     UseBreakEven          = true;
 input double   BreakEvenTrigger      = 1.5;        // Move to BE after this profit ($)
 input double   BreakEvenProfit       = 0.2;        // Lock this profit ($)
 
+input group "=== BROKER STOP LEVELS (v1.25) ==="
+input double   StopsSpreadBuffer     = 1.0;        // Spreads added to the broker min stop distance
+input int      ExtraStopBufferPoints = 0;          // Extra points added to the min stop distance
+input int      InvalidStopsCooldownMin = 30;       // Pause a symbol this long after an [invalid stops] entry
+input int      ModifyMinSeconds      = 3;          // Min seconds between SL modify attempts per ticket
+input int      ModifyMaxBackoffSec   = 300;        // Max wait after repeated modify rejections
+input double   TrailMinImproveMoney  = 0.10;       // Only move SL if it locks at least this much more ($)
+
 input group "=== NEWS FILTER (Optional) ==="
 input bool     UseNewsFilter         = false;
 input int      NewsMinutesBefore     = 30;
@@ -78,7 +86,19 @@ struct SymbolData
    int      emaHandle;
    int      pendingSignal;
    int      pendingAgeM1;
+   datetime blockedUntil;   // v1.25: cooldown after [invalid stops] on entry
+   int      stopsFails;     // v1.25: consecutive [invalid stops] entry rejections
 };
+
+// v1.25: per-ticket SL modify throttle
+struct ModifyState
+{
+   ulong    ticket;
+   datetime nextAllowed;
+   double   lastRejectedSL;
+   int      fails;
+};
+ModifyState modStates[];
 
 SymbolData symbols[];
 int        symbolCount = 0;
@@ -211,6 +231,8 @@ int OnInit()
       symbols[symbolCount].emaHandle = INVALID_HANDLE;
       symbols[symbolCount].pendingSignal = 0;
       symbols[symbolCount].pendingAgeM1 = 0;
+      symbols[symbolCount].blockedUntil = 0;
+      symbols[symbolCount].stopsFails = 0;
 
       for(int c = 0; c < customCount; c++)
       {
@@ -259,7 +281,7 @@ int OnInit()
    dailyStartBalance = AccountInfoDouble(ACCOUNT_BALANCE);
    dailyStartDate = TimeCurrent();
 
-   Print("=== DerivSMC_EA v1.24 Started ===");
+   Print("=== DerivSMC_EA v1.25 Started ===");
    Print("Symbols loaded: ", symbolCount,
          " | from file=", (SymbolsFromFile ? SymbolsFile : "SymbolsList"),
          " | Structure=", UseMarketStructure,
@@ -309,6 +331,12 @@ void OnTick()
       if(symbols[i].cooldown > 0)
       {
          symbols[i].cooldown--;
+         continue;
+      }
+
+      if(IsSymbolBlocked(i))
+      {
+         ClearPending(i);
          continue;
       }
 
@@ -365,6 +393,11 @@ void OnTick()
    }
 }
 
+bool IsSymbolBlocked(int idx)
+{
+   return (symbols[idx].blockedUntil > 0 && TimeCurrent() < symbols[idx].blockedUntil);
+}
+
 void ClearPending(int idx)
 {
    symbols[idx].pendingSignal = 0;
@@ -380,6 +413,12 @@ void TryTimedEntry(int idx)
    {
       Print(symbols[idx].name, " pending setup expired after ",
             SetupExpireM1Bars, " ", EnumToString(ExecTF), " bars");
+      ClearPending(idx);
+      return;
+   }
+
+   if(IsSymbolBlocked(idx))
+   {
       ClearPending(idx);
       return;
    }
@@ -574,54 +613,227 @@ double MoneyToPriceDistance(string sym, double lot, double money)
    return money * tickSize / (tickValue * lot);
 }
 
+//------------------- PRICE / STOP-LEVEL HELPERS (v1.25) --------------
+double SymTickSize(string sym)
+{
+   double ts = SymbolInfoDouble(sym, SYMBOL_TRADE_TICK_SIZE);
+   if(ts <= 0) ts = SymbolInfoDouble(sym, SYMBOL_POINT);
+   return ts;
+}
+
+// Round a price to the symbol tick size. dir: -1 = down, 1 = up, 0 = nearest
+double RoundToTick(string sym, double price, int dir)
+{
+   double ts = SymTickSize(sym);
+   int digits = (int)SymbolInfoInteger(sym, SYMBOL_DIGITS);
+   if(ts <= 0) return NormalizeDouble(price, digits);
+   double n = price / ts;
+   double r;
+   if(dir < 0)      r = MathFloor(n + 1e-7);
+   else if(dir > 0) r = MathCeil(n - 1e-7);
+   else             r = MathRound(n);
+   return NormalizeDouble(r * ts, digits);
+}
+
+// Min distance between price and SL/TP the broker will accept, plus a buffer
+double MinStopDistance(string sym, double bid, double ask, int extraMult)
+{
+   double point  = SymbolInfoDouble(sym, SYMBOL_POINT);
+   long   stops  = SymbolInfoInteger(sym, SYMBOL_TRADE_STOPS_LEVEL);
+   long   freeze = SymbolInfoInteger(sym, SYMBOL_TRADE_FREEZE_LEVEL);
+   long   lvl    = (stops > freeze ? stops : freeze);
+   double spread = ask - bid;
+   if(spread < 0) spread = 0;
+
+   double dist = (double)lvl * point
+               + spread * StopsSpreadBuffer
+               + (double)ExtraStopBufferPoints * point;
+   if(extraMult > 1) dist *= extraMult;
+
+   double minTicks = 2.0 * SymTickSize(sym);
+   if(dist < minTicks) dist = minTicks;
+   return dist;
+}
+
+// Money lost per 1.0 lot per 1.0 price unit (uses loss tick value when available)
+double LossPerPriceUnit(string sym)
+{
+   double tickSize = SymbolInfoDouble(sym, SYMBOL_TRADE_TICK_SIZE);
+   double tvLoss   = SymbolInfoDouble(sym, SYMBOL_TRADE_TICK_VALUE_LOSS);
+   double tv       = SymbolInfoDouble(sym, SYMBOL_TRADE_TICK_VALUE);
+   double useTv    = (tvLoss > tv ? tvLoss : tv);   // the larger = the safer estimate
+   if(tickSize <= 0 || useTv <= 0) return 0;
+   return useTv / tickSize;
+}
+
+// Worst-case loss ($, positive) if 'lot' is filled at 'entry' (+ slippage) and stopped at 'sl'
+double LossAtSL(string sym, int signal, double lot, double entry, double sl)
+{
+   double point    = SymbolInfoDouble(sym, SYMBOL_POINT);
+   double slipDist = (double)Slippage * point;   // allowed fill deviation
+   double worstEntry = (signal == 1 ? entry + slipDist : entry - slipDist);
+   double dist = MathAbs(worstEntry - sl);
+
+   double perUnit = LossPerPriceUnit(sym);
+   double lossTv  = (perUnit > 0 ? dist * perUnit * lot : 0);
+
+   double lossCalc = 0;
+   double profit   = 0;
+   ENUM_ORDER_TYPE ot = (signal == 1 ? ORDER_TYPE_BUY : ORDER_TYPE_SELL);
+   if(OrderCalcProfit(ot, sym, lot, worstEntry, sl, profit))
+      lossCalc = MathAbs(profit);
+
+   if(perUnit <= 0 && lossCalc <= 0) return -1;   // cannot measure -> caller skips
+   return MathMax(lossTv, lossCalc);
+}
+
 //------------------- OPEN TRADE -------------------------------------
-void OpenTrade(int idx, int signal)
+bool OpenTrade(int idx, int signal)
 {
    string sym = symbols[idx].name;
    double risk = symbols[idx].risk;
+   if(risk <= 0) return false;
 
    double atr[];
    ArraySetAsSeries(atr, true);
-   if(CopyBuffer(symbols[idx].atrHandle, 0, 1, 1, atr) < 1) return;
-   if(atr[0] <= 0) return;
+   if(CopyBuffer(symbols[idx].atrHandle, 0, 1, 1, atr) < 1) return false;
+   if(atr[0] <= 0) return false;
+
+   MqlTick tick;
+   if(!SymbolInfoTick(sym, tick) || tick.bid <= 0 || tick.ask <= 0) return false;
+   double bid = tick.bid;
+   double ask = tick.ask;
 
    double slDistance = atr[0] * 1.5;
-   double tpDistance = slDistance * RR_Ratio;
 
-   double tickSize  = SymbolInfoDouble(sym, SYMBOL_TRADE_TICK_SIZE);
-   double tickValue = SymbolInfoDouble(sym, SYMBOL_TRADE_TICK_VALUE);
-   if(tickValue <= 0 || tickSize <= 0) return;
-
-   double lot = risk / ((slDistance / tickSize) * tickValue);
-   lot = NormalizeLot(sym, lot);
-   if(lot < SymbolInfoDouble(sym, SYMBOL_VOLUME_MIN)) return;
-
-   SetFillingForSymbol(sym);
+   // Broker min distance (stops/freeze level + spread buffer); grows after rejections
+   int mult = 1 + symbols[idx].stopsFails;
+   if(mult > 4) mult = 4;
+   double minDist = MinStopDistance(sym, bid, ask, mult);
+   if(slDistance < minDist)
+   {
+      Print(sym, " SL ", DoubleToString(slDistance, 8), " inside broker min ",
+            DoubleToString(minDist, 8), " - widening SL, lot is recomputed for $", risk);
+      slDistance = minDist;
+   }
 
    double price, sl, tp;
-   int digits = (int)SymbolInfoInteger(sym, SYMBOL_DIGITS);
-
    if(signal == 1)
    {
-      price = SymbolInfoDouble(sym, SYMBOL_ASK);
-      sl = NormalizeDouble(price - slDistance, digits);
-      tp = NormalizeDouble(price + tpDistance, digits);
-      if(trade.Buy(lot, sym, price, sl, tp, "SMC Buy"))
-         Print(sym, " market BUY lot ", lot);
+      price = ask;
+      sl = RoundToTick(sym, price - slDistance, -1);        // round away from price
+      double slD = price - sl;
+      double tpD = MathMax(slD * RR_Ratio, minDist);
+      tp = RoundToTick(sym, price + tpD, 1);
+      // Correct side checks (buy SL/TP are triggered by bid)
+      if(sl > bid - minDist) sl = RoundToTick(sym, bid - minDist, -1);
+      if(sl >= bid || tp <= ask) { Print(sym, " BUY skipped: stops on wrong side"); return false; }
    }
    else
    {
-      price = SymbolInfoDouble(sym, SYMBOL_BID);
-      sl = NormalizeDouble(price + slDistance, digits);
-      tp = NormalizeDouble(price - tpDistance, digits);
-      if(trade.Sell(lot, sym, price, sl, tp, "SMC Sell"))
-         Print(sym, " market SELL lot ", lot);
+      price = bid;
+      sl = RoundToTick(sym, price + slDistance, 1);
+      double slD = sl - price;
+      double tpD = MathMax(slD * RR_Ratio, minDist);
+      tp = RoundToTick(sym, price - tpD, -1);
+      // Sell SL/TP are triggered by ask
+      if(sl < ask + minDist) sl = RoundToTick(sym, ask + minDist, 1);
+      if(sl <= ask || tp >= bid || tp <= 0) { Print(sym, " SELL skipped: stops on wrong side"); return false; }
+   }
+
+   // ---- Lot from the FINAL stop, then hard-verify the $ loss ----
+   double perUnit = LossPerPriceUnit(sym);
+   if(perUnit <= 0) return false;
+   double point    = SymbolInfoDouble(sym, SYMBOL_POINT);
+   double riskDist = MathAbs(price - sl) + (double)Slippage * point;   // entry side incl. spread + slippage
+   if(riskDist <= 0) return false;
+
+   double lot = NormalizeLot(sym, risk / (riskDist * perUnit));   // rounded DOWN to volume step
+   double minLot = SymbolInfoDouble(sym, SYMBOL_VOLUME_MIN);
+   double step   = SymbolInfoDouble(sym, SYMBOL_VOLUME_STEP);
+   if(lot <= 0 || lot < minLot)
+   {
+      Print(sym, " skipped: min lot would risk more than $", risk);
+      return false;
+   }
+
+   double loss = LossAtSL(sym, signal, lot, price, sl);
+   int guard = 0;
+   while(loss > risk && guard < 1000)
+   {
+      lot = NormalizeLot(sym, lot - step);
+      if(lot <= 0 || lot < minLot) break;
+      loss = LossAtSL(sym, signal, lot, price, sl);
+      guard++;
+   }
+   if(lot <= 0 || lot < minLot || loss < 0 || loss > risk)
+   {
+      Print(sym, " skipped: cannot keep loss at SL <= $", risk, " (loss=", DoubleToString(loss, 2), ")");
+      return false;
+   }
+
+   SetFillingForSymbol(sym);
+
+   bool ok;
+   if(signal == 1) ok = trade.Buy(lot, sym, price, sl, tp, "SMC Buy");
+   else            ok = trade.Sell(lot, sym, price, sl, tp, "SMC Sell");
+
+   uint rc = trade.ResultRetcode();
+   if(ok && (rc == TRADE_RETCODE_DONE || rc == TRADE_RETCODE_PLACED || rc == TRADE_RETCODE_DONE_PARTIAL))
+   {
+      Print(sym, " market ", (signal == 1 ? "BUY" : "SELL"), " lot ", lot,
+            " sl ", sl, " tp ", tp, " max loss $", DoubleToString(loss, 2));
+      symbols[idx].stopsFails = 0;
+      symbols[idx].blockedUntil = 0;
+      return true;
+   }
+
+   if(rc == TRADE_RETCODE_INVALID_STOPS)
+   {
+      symbols[idx].stopsFails++;
+      symbols[idx].blockedUntil = TimeCurrent() + InvalidStopsCooldownMin * 60;
+      Print(sym, " entry rejected [invalid stops] (", symbols[idx].stopsFails,
+            "x) - pausing ", InvalidStopsCooldownMin, " min, next try uses a wider stop buffer");
+   }
+   else
+      Print(sym, " entry failed: ", rc, " ", trade.ResultRetcodeDescription());
+   return false;
+}
+
+//------------------- MODIFY THROTTLE (v1.25) -------------------------
+int ModStateIndex(ulong ticket)
+{
+   int n = ArraySize(modStates);
+   for(int i = 0; i < n; i++)
+      if(modStates[i].ticket == ticket) return i;
+   ArrayResize(modStates, n + 1);
+   modStates[n].ticket = ticket;
+   modStates[n].nextAllowed = 0;
+   modStates[n].lastRejectedSL = 0;
+   modStates[n].fails = 0;
+   return n;
+}
+
+// Drop throttle entries for positions that are closed
+void PruneModStates()
+{
+   int n = ArraySize(modStates);
+   for(int i = n - 1; i >= 0; i--)
+   {
+      if(PositionSelectByTicket(modStates[i].ticket)) continue;
+      int last = ArraySize(modStates) - 1;
+      if(i != last) modStates[i] = modStates[last];
+      ArrayResize(modStates, last);
    }
 }
 
 //------------------- MANAGE OPEN POSITIONS (Trailing + BE) ----------
 void ManageOpenPositions()
 {
+   if(!UseBreakEven && !UseTrailingStop) return;
+   PruneModStates();
+   datetime now = TimeCurrent();
+
    for(int i = PositionsTotal() - 1; i >= 0; i--)
    {
       ulong ticket = PositionGetTicket(i);
@@ -636,54 +848,115 @@ void ManageOpenPositions()
       double profit = PositionGetDouble(POSITION_PROFIT);
       double lot = PositionGetDouble(POSITION_VOLUME);
 
-      double bid = SymbolInfoDouble(sym, SYMBOL_BID);
-      double ask = SymbolInfoDouble(sym, SYMBOL_ASK);
-      int digits = (int)SymbolInfoInteger(sym, SYMBOL_DIGITS);
+      bool wantBE    = (UseBreakEven && profit >= BreakEvenTrigger);
+      bool wantTrail = (UseTrailingStop && profit >= TrailingStart);
+      if(!wantBE && !wantTrail) continue;
 
-      if(UseBreakEven && profit >= BreakEvenTrigger)
+      int ms = ModStateIndex(ticket);
+      if(now < modStates[ms].nextAllowed) continue;   // throttle / backoff
+
+      MqlTick tick;
+      if(!SymbolInfoTick(sym, tick) || tick.bid <= 0 || tick.ask <= 0) continue;
+      double bid = tick.bid;
+      double ask = tick.ask;
+
+      double ts      = SymTickSize(sym);
+      double point   = SymbolInfoDouble(sym, SYMBOL_POINT);
+      double minDist = MinStopDistance(sym, bid, ask, 1);
+      double freezeD = (double)SymbolInfoInteger(sym, SYMBOL_TRADE_FREEZE_LEVEL) * point;
+      double minImprove = MoneyToPriceDistance(sym, lot, TrailMinImproveMoney);
+      if(minImprove < ts) minImprove = ts;
+
+      double newSL = 0;
+
+      if(type == POSITION_TYPE_BUY)
       {
-         double beOffset = MoneyToPriceDistance(sym, lot, BreakEvenProfit);
-         if(beOffset > 0)
+         // TP about to be hit (or inside freeze/stops zone): leave the position alone
+         if(currentTP > 0 && currentTP - bid < minDist) continue;
+         if(currentSL > 0 && freezeD > 0 && bid - currentSL <= freezeD) continue;
+
+         double cand = currentSL;
+         if(wantBE)
          {
-            if(type == POSITION_TYPE_BUY)
+            double beOffset = MoneyToPriceDistance(sym, lot, BreakEvenProfit);
+            if(beOffset > 0)
             {
-               double bePrice = NormalizeDouble(openPrice + beOffset, digits);
-               if(currentSL < bePrice && bePrice < bid)
-               {
-                  if(trade.PositionModify(ticket, bePrice, currentTP))
-                     currentSL = bePrice;
-               }
-            }
-            else
-            {
-               double bePrice = NormalizeDouble(openPrice - beOffset, digits);
-               if((currentSL > bePrice || currentSL == 0) && bePrice > ask)
-               {
-                  if(trade.PositionModify(ticket, bePrice, currentTP))
-                     currentSL = bePrice;
-               }
+               double be = RoundToTick(sym, openPrice + beOffset, -1);
+               if(be > cand) cand = be;
             }
          }
+         if(wantTrail)
+         {
+            double trailDist = MoneyToPriceDistance(sym, lot, TrailingStep);
+            if(trailDist > 0)
+            {
+               double tr = RoundToTick(sym, bid - trailDist, -1);
+               if(tr > cand) cand = tr;
+            }
+         }
+         double maxSL = RoundToTick(sym, bid - minDist, -1);   // must stay below bid by min dist
+         if(cand > maxSL) cand = maxSL;
+         if(currentTP > 0 && currentTP - cand < minDist) continue;  // too close to TP: stop trailing
+         if(cand <= 0) continue;
+         if(currentSL > 0 && cand - currentSL < minImprove) continue;
+         newSL = cand;
+      }
+      else
+      {
+         if(currentTP > 0 && ask - currentTP < minDist) continue;
+         if(currentSL > 0 && freezeD > 0 && currentSL - ask <= freezeD) continue;
+
+         double cand = currentSL;   // 0 = no SL yet
+         if(wantBE)
+         {
+            double beOffset = MoneyToPriceDistance(sym, lot, BreakEvenProfit);
+            if(beOffset > 0)
+            {
+               double be = RoundToTick(sym, openPrice - beOffset, 1);
+               if(cand == 0 || be < cand) cand = be;
+            }
+         }
+         if(wantTrail)
+         {
+            double trailDist = MoneyToPriceDistance(sym, lot, TrailingStep);
+            if(trailDist > 0)
+            {
+               double tr = RoundToTick(sym, ask + trailDist, 1);
+               if(cand == 0 || tr < cand) cand = tr;
+            }
+         }
+         double minSL = RoundToTick(sym, ask + minDist, 1);    // must stay above ask by min dist
+         if(cand > 0 && cand < minSL) cand = minSL;
+         if(cand <= 0) continue;
+         if(currentTP > 0 && cand - currentTP < minDist) continue;
+         if(currentSL > 0 && currentSL - cand < minImprove) continue;
+         newSL = cand;
       }
 
-      if(UseTrailingStop && profit >= TrailingStart)
+      // Never re-send an SL the broker already refused, or the current one
+      if(MathAbs(newSL - currentSL) < ts * 0.5) continue;
+      if(modStates[ms].lastRejectedSL > 0 && MathAbs(newSL - modStates[ms].lastRejectedSL) < ts * 0.5)
+         continue;
+
+      bool ok = trade.PositionModify(ticket, newSL, currentTP);
+      uint rc = trade.ResultRetcode();
+      if(ok && (rc == TRADE_RETCODE_DONE || rc == TRADE_RETCODE_NO_CHANGES))
       {
-         double trailDist = MoneyToPriceDistance(sym, lot, TrailingStep);
-         if(trailDist > 0)
-         {
-            if(type == POSITION_TYPE_BUY)
-            {
-               double newSL = NormalizeDouble(bid - trailDist, digits);
-               if(newSL > currentSL && newSL < bid)
-                  trade.PositionModify(ticket, newSL, currentTP);
-            }
-            else
-            {
-               double newSL = NormalizeDouble(ask + trailDist, digits);
-               if((newSL < currentSL || currentSL == 0) && newSL > ask)
-                  trade.PositionModify(ticket, newSL, currentTP);
-            }
-         }
+         modStates[ms].fails = 0;
+         modStates[ms].lastRejectedSL = 0;
+         modStates[ms].nextAllowed = now + ModifyMinSeconds;
+      }
+      else
+      {
+         modStates[ms].fails++;
+         modStates[ms].lastRejectedSL = newSL;
+         int f = modStates[ms].fails;
+         if(f > 10) f = 10;
+         int wait = (int)MathMin((double)ModifyMaxBackoffSec, (double)ModifyMinSeconds * MathPow(2.0, f));
+         if(wait < 1) wait = 1;
+         modStates[ms].nextAllowed = now + wait;
+         Print(sym, " #", ticket, " SL modify to ", newSL, " rejected (", rc, " ",
+               trade.ResultRetcodeDescription(), ") - next try in ", wait, "s");
       }
    }
 }
@@ -696,10 +969,17 @@ double NormalizeLot(string sym, double lot)
    double step   = SymbolInfoDouble(sym, SYMBOL_VOLUME_STEP);
 
    if(step <= 0) return 0;
-   lot = MathFloor(lot / step) * step;
+   lot = MathFloor(lot / step + 1e-7) * step;   // round down only, never up past risk
    if(lot < minLot) return 0;
    if(lot > maxLot) lot = maxLot;
-   return NormalizeDouble(lot, 2);
+   int volDigits = 0;
+   double s = step;
+   while(volDigits < 8 && MathAbs(s - MathRound(s)) > 1e-8)
+   {
+      s *= 10.0;
+      volDigits++;
+   }
+   return NormalizeDouble(lot, volDigits);
 }
 
 int CountPositionsOnSymbol(string sym)

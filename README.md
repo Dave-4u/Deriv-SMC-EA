@@ -1,10 +1,16 @@
-# Deriv-SMC-EA v1.24
+# Deriv-SMC-EA v1.25
 
 **Multi-Pair MT5 Expert Advisor**  
 Strategies: **CRT → Rejection Block → Order Block**  
 with an H1 trend filter, setup-timeframe market structure, and 1-minute market-entry timing.
 
-### New in v1.24
+### New in v1.25
+- Entries respect the broker's stop and freeze levels plus a spread buffer, with SL/TP rounded to tick size and placed on the correct side of bid/ask. If the SL has to be widened, the lot is recalculated so the trade still risks no more than `RiskMoney`. TP moves out to keep the same RR.
+- Strict $ risk: the lot is based on the final SL measured from the real entry price (ask or bid, so spread is included) plus `Slippage`. It uses the larger of `TICK_VALUE_LOSS` and `TICK_VALUE`, rounds down to the volume step, and re-checks the loss at SL with `OrderCalcProfit`. If the loss is still above `RiskMoney`, the lot is reduced, and the trade is skipped if min lot still risks too much.
+- A symbol whose entry is rejected with `[invalid stops]` pauses for `InvalidStopsCooldownMin` minutes, and the next try uses a wider buffer.
+- Break-even and trailing are combined into one SL update that runs only when it locks at least `TrailMinImproveMoney` more. It is skipped when the TP is about to be hit, never resends an SL the broker refused, is throttled per ticket (`ModifyMinSeconds`), and backs off after rejections.
+
+### From v1.24
 - Reads a symbols `.txt` from `MQL5\Files` (default `DaveSymbols.txt`: one name per line or comma-separated, `#` comments). Falls back to SymbolsList if the file is missing or empty.
 
 ### Also in v1.23
@@ -72,6 +78,16 @@ TrailingStep         = 0.5          // Trail by $0.5
 UseBreakEven         = true
 BreakEvenTrigger     = 1.5          // Move SL to BE after $1.5 profit
 BreakEvenProfit      = 0.2          // Lock $0.2 profit
+```
+
+### Broker stop levels (v1.25)
+```
+StopsSpreadBuffer       = 1.0       // Spreads added to the broker min stop distance
+ExtraStopBufferPoints   = 0         // Extra points on top
+InvalidStopsCooldownMin = 30        // Pause a symbol after an [invalid stops] entry
+ModifyMinSeconds        = 3         // Min seconds between SL updates per trade
+ModifyMaxBackoffSec     = 300       // Max wait after repeated rejections
+TrailMinImproveMoney    = 0.10      // Move SL only if it locks $0.10 more
 ```
 
 ### News Filter (Optional)
