@@ -64,9 +64,9 @@ input double   BreakEvenProfit       = 0.2;        // Lock this profit ($)
 input group "=== BROKER STOP LEVELS (v1.25) ==="
 input double   StopsSpreadBuffer     = 1.0;        // Spreads added to the broker min stop distance
 input int      ExtraStopBufferPoints = 0;          // Extra points added to the min stop distance
-input int      InvalidStopsCooldownMin = 30;
+input int      InvalidStopsCooldownMin = 30;      // Pause a symbol this long after an [invalid stops] entry
 input bool     UseDeepLimitFallback  = true;       // If min lot risks > $ at market, place a limit nearer the SL
-input int      LimitExpireMinutes    = 60;         // Deep limit lifetime (broker expiry or manual cancel)       // Pause a symbol this long after an [invalid stops] entry
+input int      LimitExpireMinutes    = 60;         // Deep limit lifetime (broker expiry or manual cancel)
 input int      ModifyMinSeconds      = 3;          // Min seconds between SL modify attempts per ticket
 input int      ModifyMaxBackoffSec   = 300;        // Max wait after repeated modify rejections
 input double   TrailMinImproveMoney  = 0.10;       // Only move SL if it locks at least this much more ($)
