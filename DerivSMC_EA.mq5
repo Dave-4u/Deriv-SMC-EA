@@ -3,10 +3,11 @@
 //|  Multi-Pair | CRT + Rejection + OrderBlock | Trailing + BE       |
 //|  Works on Synthetics + Gold + Forex | Fixed $ Risk               |
 //|  v1.26: spike filter, R-based exits, daily/symbol loss stops    |
+//|  v1.27: structure TP, bigger RR, partial close + runner         |
 //+------------------------------------------------------------------+
 #property copyright "Dave-4u"
 #property link      "https://github.com/Dave-4u/Deriv-SMC-EA"
-#property version   "1.26"
+#property version   "1.27"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -55,23 +56,43 @@ input bool     UseBigCandleFilter    = true;       // Skip after an oversized ca
 input double   BigCandleATRMult      = 2.0;        // Last closed M1/M5 bar range > this x ATR(14) = skip
 input double   MaxChaseATR           = 0.5;        // Skip if price is this x ATR beyond the setup zone (0 = off)
 
+input group "=== ENTRY ALIGNMENT (v1.27) ==="
+input bool     UseEntryAlignment     = true;       // Before ANY order: M1 must be moving the setup's way
+input int      AlignFastEMA          = 9;          // M1 fast EMA (buy: fast > slow and bid > fast)
+input int      AlignSlowEMA          = 21;         // M1 slow EMA
+input int      AlignWaitBars         = 5;          // Not aligned: wait this many M1 bars, then drop the setup
+
 input group "=== M1 ENTRY TIMING ==="
 input bool     UseM1EntryTiming      = true;       // If false, enter at market when the setup appears
 input int      SetupExpireM1Bars     = 15;         // Pending setup dies after this many new M1 bars
 
 input group "=== TRADE MANAGEMENT ==="
-input double   RR_Ratio              = 2.0;
+input double   RR_Ratio              = 3.0;        // TP = this x SL distance when no structure target is used
 input int      Slippage              = 30;
+
+input group "=== STRUCTURE TAKE-PROFIT (v1.27) ==="
+input bool     UseStructureTP        = true;       // TP at the next swing high/low on the setup chart (EntryTF)
+input int      StructureTPLookback   = 100;        // Bars on the setup chart to look for the target swing
+input double   MinTP_R               = 2.5;        // Swing used only if it is at least this x R away
+input double   MaxTP_R               = 6.0;        // TP never further than this x R (also the runner TP)
+input double   StructureTPBufferATR  = 0.1;        // Put TP this x ATR before the swing so it fills
+
+input group "=== PARTIAL CLOSE & RUNNER (v1.27) ==="
+input bool     UsePartialClose       = true;       // Bank part of the trade at PartialCloseAtR
+input double   PartialCloseAtR       = 2.0;        // Close part when profit >= this x R
+input double   PartialClosePercent   = 50.0;       // % of the volume to close (skipped if lot steps do not allow)
+input bool     RunnerRemoveTP        = false;      // After partial: move TP out to MaxTP_R so the rest can run
 
 input group "=== BREAK-EVEN (R = initial risk) ==="
 input bool     UseBreakEven          = true;
-input double   BreakEvenAtR          = 1.0;        // Move SL to BE when profit >= this x R
-input double   BreakEvenLockR        = 0.1;        // Lock this x R (+ spread) beyond entry
+input double   BreakEvenAtR          = 1.5;        // Move SL to BE when profit >= this x R
+input double   BreakEvenLockR        = 0.3;        // Lock this x R (+ spread) beyond entry
 
 input group "=== TRAILING STOP (R / ATR) ==="
 input bool     UseTrailingStop       = true;
-input double   TrailStartR           = 1.5;        // Start trailing when profit >= this x R
-input double   TrailATRMult          = 1.5;        // Trail distance = this x ATR(EntryTF)
+input double   TrailStartR           = 2.0;        // Start trailing when profit >= this x R
+input double   TrailATRMult          = 2.0;        // Trail distance = this x ATR(TrailATRTF)
+input ENUM_TIMEFRAMES TrailATRTF     = PERIOD_M5;  // Timeframe of the ATR used for the trail distance
 
 input group "=== BROKER STOP LEVELS (v1.25) ==="
 input double   StopsSpreadBuffer     = 1.0;        // Spreads added to the broker min stop distance
@@ -103,6 +124,12 @@ struct SymbolData
    int      emaHandle;
    int      atrExecHandle;  // v1.26: ATR(14) on ExecTF for the big-candle filter
    int      emaConfHandle;  // v1.26: EMA on ConfirmTF
+   int      atrTrailHandle; // v1.27: ATR(14) on TrailATRTF
+   int      emaFastXHandle; // v1.27: fast EMA on ExecTF (alignment)
+   int      emaSlowXHandle; // v1.27: slow EMA on ExecTF (alignment)
+   int      alignWait;      // v1.27: M1 bars waited for alignment (0 = not waiting)
+   bool     alignFailed;    // v1.27: last OpenTrade stopped only because not aligned
+   string   alignReason;    // v1.27: why it was not aligned
    int      consecLosses;   // v1.26: losses in a row
    datetime pausedUntil;    // v1.26: per-symbol loss pause
    int      pendingSignal;
@@ -122,6 +149,7 @@ struct ModifyState
    double   lastRejectedSL;
    int      fails;
    double   riskDist;       // v1.26: initial entry-to-SL distance (0 = not read yet, -1 = unknown)
+   int      partialFails;   // v1.27: failed partial-close attempts
 };
 ModifyState modStates[];
 bool       dailyStopActive = false;
@@ -260,6 +288,12 @@ int OnInit()
       symbols[symbolCount].emaHandle = INVALID_HANDLE;
       symbols[symbolCount].atrExecHandle = INVALID_HANDLE;
       symbols[symbolCount].emaConfHandle = INVALID_HANDLE;
+      symbols[symbolCount].atrTrailHandle = INVALID_HANDLE;
+      symbols[symbolCount].emaFastXHandle = INVALID_HANDLE;
+      symbols[symbolCount].emaSlowXHandle = INVALID_HANDLE;
+      symbols[symbolCount].alignWait = 0;
+      symbols[symbolCount].alignFailed = false;
+      symbols[symbolCount].alignReason = "";
       symbols[symbolCount].consecLosses = 0;
       symbols[symbolCount].pausedUntil = 0;
       symbols[symbolCount].pendingSignal = 0;
@@ -291,15 +325,23 @@ int OnInit()
       int emaHandle = iMA(baseSymbols[i], TrendTF, EMA_Period, 0, MODE_EMA, PRICE_CLOSE);
       int atrXHandle = iATR(baseSymbols[i], ExecTF, 14);
       int emaCHandle = iMA(baseSymbols[i], ConfirmTF, EMA_Period, 0, MODE_EMA, PRICE_CLOSE);
+      int atrTHandle = iATR(baseSymbols[i], TrailATRTF, 14);
+      int emaFXHandle = iMA(baseSymbols[i], ExecTF, (AlignFastEMA > 0 ? AlignFastEMA : 9),  0, MODE_EMA, PRICE_CLOSE);
+      int emaSXHandle = iMA(baseSymbols[i], ExecTF, (AlignSlowEMA > 0 ? AlignSlowEMA : 21), 0, MODE_EMA, PRICE_CLOSE);
 
       if(atrHandle == INVALID_HANDLE || emaHandle == INVALID_HANDLE ||
-         atrXHandle == INVALID_HANDLE || emaCHandle == INVALID_HANDLE)
+         atrXHandle == INVALID_HANDLE || emaCHandle == INVALID_HANDLE ||
+         atrTHandle == INVALID_HANDLE || emaFXHandle == INVALID_HANDLE ||
+         emaSXHandle == INVALID_HANDLE)
       {
          Print("Failed to create handles for ", baseSymbols[i]);
          if(atrHandle  != INVALID_HANDLE) IndicatorRelease(atrHandle);
          if(emaHandle  != INVALID_HANDLE) IndicatorRelease(emaHandle);
          if(atrXHandle != INVALID_HANDLE) IndicatorRelease(atrXHandle);
          if(emaCHandle != INVALID_HANDLE) IndicatorRelease(emaCHandle);
+         if(atrTHandle != INVALID_HANDLE) IndicatorRelease(atrTHandle);
+         if(emaFXHandle != INVALID_HANDLE) IndicatorRelease(emaFXHandle);
+         if(emaSXHandle != INVALID_HANDLE) IndicatorRelease(emaSXHandle);
          continue;
       }
 
@@ -307,6 +349,9 @@ int OnInit()
       symbols[symbolCount].emaHandle = emaHandle;
       symbols[symbolCount].atrExecHandle = atrXHandle;
       symbols[symbolCount].emaConfHandle = emaCHandle;
+      symbols[symbolCount].atrTrailHandle = atrTHandle;
+      symbols[symbolCount].emaFastXHandle = emaFXHandle;
+      symbols[symbolCount].emaSlowXHandle = emaSXHandle;
       symbolCount++;
    }
 
@@ -326,14 +371,18 @@ int OnInit()
 
    RebuildLossPauses();
 
-   Print("=== DerivSMC_EA v1.26 Started ===");
+   Print("=== DerivSMC_EA v1.27 Started ===");
    Print("Symbols loaded: ", symbolCount,
          " | from file=", (SymbolsFromFile ? SymbolsFile : "SymbolsList"),
          " | Structure=", UseMarketStructure,
          " | M1 timing=", UseM1EntryTiming,
          " | ConfirmTF=", (UseConfirmTFTrend ? EnumToString(ConfirmTF) : "off"),
          " | spike filter=", UseSpikeDirectionFilter,
-         " | max daily loss $", MaxDailyLossMoney);
+         " | max daily loss $", MaxDailyLossMoney,
+         " | RR ", RR_Ratio, " | structure TP=", UseStructureTP,
+         " (", MinTP_R, "-", MaxTP_R, "R) | partial=", UsePartialClose,
+         " @", PartialCloseAtR, "R ", PartialClosePercent, "%",
+         " | alignment=", UseEntryAlignment, " (wait ", AlignWaitBars, " M1 bars)");
    for(int i=0; i<symbolCount; i++)
       Print("  → ", symbols[i].name, " | Risk: $", symbols[i].risk);
 
@@ -349,6 +398,9 @@ void OnDeinit(const int reason)
       if(symbols[i].emaHandle != INVALID_HANDLE) IndicatorRelease(symbols[i].emaHandle);
       if(symbols[i].atrExecHandle != INVALID_HANDLE) IndicatorRelease(symbols[i].atrExecHandle);
       if(symbols[i].emaConfHandle != INVALID_HANDLE) IndicatorRelease(symbols[i].emaConfHandle);
+      if(symbols[i].atrTrailHandle != INVALID_HANDLE) IndicatorRelease(symbols[i].atrTrailHandle);
+      if(symbols[i].emaFastXHandle != INVALID_HANDLE) IndicatorRelease(symbols[i].emaFastXHandle);
+      if(symbols[i].emaSlowXHandle != INVALID_HANDLE) IndicatorRelease(symbols[i].emaSlowXHandle);
    }
    Print("DerivSMC_EA removed");
 }
@@ -443,6 +495,7 @@ void OnTick()
          if(signal != 0) setupType = 3;
       }
 
+      if(signal == 0 && symbols[i].alignWait > 0) continue;   // v1.27: keep waiting for alignment
       if(signal == 0 || SpikeDirectionBlocked(sym, signal))
       {
          ClearPending(i);
@@ -464,12 +517,14 @@ void OnTick()
 
       if(!UseM1EntryTiming)
       {
+         symbols[i].alignWait = 0;
          OpenTrade(i, signal);
          continue;
       }
 
       symbols[i].pendingSignal = signal;
       symbols[i].pendingAgeM1  = 0;
+      symbols[i].alignWait     = 0;
       Print(sym, " setup ", (signal == 1 ? "BUY" : "SELL"),
             " on ", EnumToString(EntryTF),
             " — waiting for ", EnumToString(ExecTF), " confirmation");
@@ -488,11 +543,33 @@ void ClearPending(int idx)
 {
    symbols[idx].pendingSignal = 0;
    symbols[idx].pendingAgeM1  = 0;
+   symbols[idx].alignWait     = 0;
 }
 
 void TryTimedEntry(int idx)
 {
    if(symbols[idx].pendingSignal == 0) return;
+
+   // v1.27: setup is waiting for M1 alignment (see EntryAligned)
+   if(symbols[idx].alignWait > 0)
+   {
+      symbols[idx].alignWait++;
+      if(symbols[idx].alignWait > AlignWaitBars)
+      {
+         Print(symbols[idx].name, " setup ", (symbols[idx].pendingSignal == 1 ? "BUY" : "SELL"),
+               " dropped: market not aligned after ", AlignWaitBars, " ", EnumToString(ExecTF),
+               " bars (last: ", symbols[idx].alignReason, ")");
+         ClearPending(idx);
+         return;
+      }
+      if(IsSymbolBlocked(idx)) { ClearPending(idx); return; }
+      if(CountAllOpenPositions() >= MaxOpenTrades) return;
+      if(CountPositionsOnSymbol(symbols[idx].name) != 0) { ClearPending(idx); return; }
+      int wsig = symbols[idx].pendingSignal;
+      OpenTrade(idx, wsig);
+      if(!symbols[idx].alignFailed) ClearPending(idx);   // placed, or skipped for a non-alignment reason
+      return;
+   }
 
    symbols[idx].pendingAgeM1++;
    if(symbols[idx].pendingAgeM1 > SetupExpireM1Bars)
@@ -890,6 +967,17 @@ string RiskGVName(ulong ticket)
    return "DSMC_" + IntegerToString(MagicNumber) + "_R_" + IntegerToString((long)ticket);
 }
 
+// v1.27: flags per ticket: partial close done (_P_), runner TP moved (_T_)
+string PartialGVName(ulong ticket)
+{
+   return "DSMC_" + IntegerToString(MagicNumber) + "_P_" + IntegerToString((long)ticket);
+}
+
+string RunnerGVName(ulong ticket)
+{
+   return "DSMC_" + IntegerToString(MagicNumber) + "_T_" + IntegerToString((long)ticket);
+}
+
 void StoreInitialRisk(ulong ticket, double dist)
 {
    if(ticket == 0 || dist <= 0) return;
@@ -935,11 +1023,15 @@ double GetInitialRiskDist(ulong ticket, ulong posId, double openPrice, double cu
 // Remove risk globals whose position/order no longer exists
 void CleanupRiskGlobals()
 {
-   string prefix = "DSMC_" + IntegerToString(MagicNumber) + "_R_";
+   string base = "DSMC_" + IntegerToString(MagicNumber) + "_";
    for(int i = GlobalVariablesTotal() - 1; i >= 0; i--)
    {
       string nm = GlobalVariableName(i);
-      if(StringFind(nm, prefix) != 0) continue;
+      string prefix = "";
+      if(StringFind(nm, base + "R_") == 0)      prefix = base + "R_";
+      else if(StringFind(nm, base + "P_") == 0) prefix = base + "P_";
+      else if(StringFind(nm, base + "T_") == 0) prefix = base + "T_";
+      if(prefix == "") continue;
       ulong t = (ulong)StringToInteger(StringSubstr(nm, StringLen(prefix)));
       if(t == 0) continue;
       if(PositionSelectByTicket(t) || OrderSelect(t)) continue;
@@ -1021,11 +1113,91 @@ double LossAtSL(string sym, int signal, double lot, double entry, double sl)
    return MathMax(lossTv, lossCalc);
 }
 
+//------------------- TAKE-PROFIT TARGET (v1.27) ----------------------
+// TP distance from 'entry'. rD = 1R (entry-to-SL distance used for sizing the target).
+// If UseStructureTP: the nearest swing high (buy) / swing low (sell) on the SETUP
+// chart (EntryTF, closed bars) that is at least MinTP_R away, minus a small buffer,
+// capped at MaxTP_R. Otherwise / no valid swing: RR_Ratio x rD. Never < minDist.
+// The TP only decides where profit is taken; it never changes the SL or the lot.
+double TargetDistance(string sym, int signal, double entry, double rD, double atrE, double minDist)
+{
+   if(rD <= 0) return minDist;
+   double rrD  = rD * RR_Ratio;
+   double tpD  = rrD;
+   string src  = "RR " + DoubleToString(RR_Ratio, 1);
+
+   if(UseStructureTP)
+   {
+      double buf = StructureTPBufferATR * atrE;
+      if(buf < 0) buf = 0;
+      double minD = MinTP_R * rD;
+      double maxD = (MaxTP_R > 0 ? MaxTP_R * rD : 0);
+      double levels[];
+      ArrayResize(levels, 0);
+      CollectSwingLevels(sym, EntryTF, (signal == -1), StructureTPLookback, levels);  // highs for buys, lows for sells
+      double best = 0;
+      int n = ArraySize(levels);
+      for(int i = 0; i < n; i++)
+      {
+         double d = (signal == 1 ? (levels[i] - buf) - entry : entry - (levels[i] + buf));
+         if(d <= 0 || d < minD) continue;          // not beyond entry, or too close
+         if(best == 0 || d < best) best = d;       // nearest qualifying swing
+      }
+      if(best > 0)
+      {
+         tpD = best;
+         src = "swing " + EnumToString(EntryTF);
+         if(maxD > 0 && tpD > maxD) { tpD = maxD; src += " capped " + DoubleToString(MaxTP_R, 1) + "R"; }
+      }
+   }
+   if(signal == -1 && tpD >= entry) tpD = entry * 0.5;   // sell TP must stay above 0
+   if(tpD < minDist) tpD = minDist;
+   Print(sym, " TP target: ", src, " = ", DoubleToString(tpD / rD, 2), "R");
+   return tpD;
+}
+
+//------------------- ENTRY ALIGNMENT (v1.27) ------------------------
+// Market must be moving the setup's way right before an order is sent.
+// BUY (SELL mirrored): last closed M1 bar is bullish and closes above the prior
+// M1 high (ExecBarConfirms), M1 fast EMA > slow EMA, bid > fast EMA, and price
+// is not more than MaxChaseATR x ATR past the setup zone (IsChasing).
+bool EntryAligned(int idx, int signal, double bid, double ask, double atrE, string &why)
+{
+   why = "";
+   string sym = symbols[idx].name;
+   if(!ExecBarConfirms(sym, signal))
+   {
+      why = (signal == 1 ? "last M1 bar not a bullish close above the prior high"
+                         : "last M1 bar not a bearish close below the prior low");
+      return false;
+   }
+   double f = GetBufVal(symbols[idx].emaFastXHandle, 1);
+   double s = GetBufVal(symbols[idx].emaSlowXHandle, 1);
+   if(f <= 0 || s <= 0) { why = "M1 EMA not ready"; return false; }
+   if(signal == 1 && !(f > s && bid > f))
+   {
+      why = "M1 EMA" + IntegerToString(AlignFastEMA) + "/" + IntegerToString(AlignSlowEMA) + " not bullish or bid below fast EMA";
+      return false;
+   }
+   if(signal == -1 && !(f < s && ask < f))
+   {
+      why = "M1 EMA" + IntegerToString(AlignFastEMA) + "/" + IntegerToString(AlignSlowEMA) + " not bearish or ask above fast EMA";
+      return false;
+   }
+   if(IsChasing(idx, signal, bid, ask, atrE))
+   {
+      why = "price too far past the setup zone";
+      return false;
+   }
+   return true;
+}
+
 //------------------- OPEN TRADE -------------------------------------
 bool OpenTrade(int idx, int signal)
 {
    string sym = symbols[idx].name;
    double risk = symbols[idx].risk;
+   symbols[idx].alignFailed = false;   // v1.27: set true only by the alignment gate below
    if(risk <= 0) return false;
    if(SpikeDirectionBlocked(sym, signal)) return false;
    if(IsBigCandle(idx)) return false;
@@ -1039,6 +1211,30 @@ bool OpenTrade(int idx, int signal)
    if(!SymbolInfoTick(sym, tick) || tick.bid <= 0 || tick.ask <= 0) return false;
    double bid = tick.bid;
    double ask = tick.ask;
+
+   // v1.27: alignment gate before ANY order (market entry and deep limit)
+   if(UseEntryAlignment)
+   {
+      string why = "";
+      if(!EntryAligned(idx, signal, bid, ask, atr[0], why))
+      {
+         symbols[idx].alignFailed = true;
+         symbols[idx].alignReason = why;
+         if(symbols[idx].alignWait == 0)
+         {
+            symbols[idx].pendingSignal = signal;
+            symbols[idx].pendingAgeM1  = 0;
+            symbols[idx].alignWait     = 1;
+            Print(sym, " ", (signal == 1 ? "BUY" : "SELL"), " not aligned (", why,
+                  ") - waiting up to ", AlignWaitBars, " ", EnumToString(ExecTF), " bars");
+         }
+         else
+            Print(sym, " still not aligned (", why, ") - wait ", symbols[idx].alignWait, "/", AlignWaitBars);
+         return false;
+      }
+      if(symbols[idx].alignWait > 0)
+         Print(sym, " aligned after ", symbols[idx].alignWait, " ", EnumToString(ExecTF), " bars");
+   }
 
    double slDistance = atr[0] * 1.5;
 
@@ -1061,7 +1257,7 @@ bool OpenTrade(int idx, int signal)
       // Correct side (buy SL/TP are triggered by bid)
       if(sl > bid - minDist) sl = RoundToTick(sym, bid - minDist, -1);
       double slD = price - sl;
-      double tpD = MathMax(slD * RR_Ratio, minDist);           // TP keeps the RR of the final SL
+      double tpD = TargetDistance(sym, signal, price, slD, atr[0], minDist);   // v1.27: structure / RR
       tp = RoundToTick(sym, price + tpD, 1);
       if(sl >= bid || tp <= ask) { Print(sym, " BUY skipped: stops on wrong side"); return false; }
    }
@@ -1072,7 +1268,7 @@ bool OpenTrade(int idx, int signal)
       // Correct side (sell SL/TP are triggered by ask)
       if(sl < ask + minDist) sl = RoundToTick(sym, ask + minDist, 1);
       double slD = sl - price;
-      double tpD = MathMax(slD * RR_Ratio, minDist);
+      double tpD = TargetDistance(sym, signal, price, slD, atr[0], minDist);
       tp = RoundToTick(sym, price - tpD, -1);
       if(sl <= ask || tp >= bid || tp <= 0) { Print(sym, " SELL skipped: stops on wrong side"); return false; }
    }
@@ -1314,9 +1510,18 @@ bool TryDeepLimit(int idx, int signal, double sl, double bid, double ask, double
       return false;
    }
 
-   // Same SL; TP re-based from the limit price to keep RR
+   // Same SL. v1.27: TP from the limit price, sized on the NORMAL market-entry
+   // SL distance (so a tight limit stop gets a big R), never smaller than the
+   // market-entry TP would have been.
    double slD = MathAbs(lp - sl);
-   double tpD = MathMax(slD * RR_Ratio, minDist);
+   double baseSlD = (signal == 1 ? ask - sl : sl - bid);   // SL distance a market entry had
+   if(baseSlD < slD) baseSlD = slD;
+   double mktPrice = (signal == 1 ? ask : bid);
+   double gap      = MathAbs(mktPrice - lp);                    // limit sits this far behind market
+   double mktTpD   = TargetDistance(sym, signal, mktPrice, baseSlD, atrE, minDist);
+   double tpD      = mktTpD + gap;                              // same TP price a market entry would get
+   if(tpD < baseSlD * RR_Ratio) tpD = baseSlD * RR_Ratio;       // and at least RR x the normal SL distance
+   if(tpD < minDist) tpD = minDist;
    double tp  = (signal == 1 ? RoundToTick(sym, lp + tpD, 1) : RoundToTick(sym, lp - tpD, -1));
    if(tp <= 0) return false;
 
@@ -1341,7 +1546,7 @@ bool TryDeepLimit(int idx, int signal, double sl, double bid, double ask, double
    {
       StoreInitialRisk(trade.ResultOrder(), slD);
       Print(sym, " deep limit fallback: ", side, " ", lp, " at ", bestSrc, " lot ", lot,
-            " sl ", sl, " tp ", tp, " max loss $", DoubleToString(loss, 2),
+            " sl ", sl, " tp ", tp, " (", DoubleToString(tpD / slD, 1), "R) max loss $", DoubleToString(loss, 2),
             (tt == ORDER_TIME_SPECIFIED ? " (broker expiry)" : " (manual expiry)"));
       symbols[idx].stopsFails = 0;
       return true;
@@ -1412,6 +1617,7 @@ int ModStateIndex(ulong ticket)
    modStates[n].lastRejectedSL = 0;
    modStates[n].fails = 0;
    modStates[n].riskDist = 0;
+   modStates[n].partialFails = 0;
    return n;
 }
 
@@ -1423,6 +1629,8 @@ void PruneModStates()
    {
       if(PositionSelectByTicket(modStates[i].ticket)) continue;
       GlobalVariableDel(RiskGVName(modStates[i].ticket));
+      GlobalVariableDel(PartialGVName(modStates[i].ticket));
+      GlobalVariableDel(RunnerGVName(modStates[i].ticket));
       int last = ArraySize(modStates) - 1;
       if(i != last) modStates[i] = modStates[last];
       ArrayResize(modStates, last);
@@ -1433,7 +1641,7 @@ void PruneModStates()
 void ManageOpenPositions()
 {
    PruneModStates();
-   if(!UseBreakEven && !UseTrailingStop) return;
+   if(!UseBreakEven && !UseTrailingStop && !UsePartialClose) return;
    datetime now = TimeCurrent();
 
    for(int i = PositionsTotal() - 1; i >= 0; i--)
@@ -1469,9 +1677,6 @@ void ManageOpenPositions()
 
       double profitDist = (type == POSITION_TYPE_BUY ? bid - openPrice : openPrice - ask);
       double profitR = profitDist / rDist;
-      bool wantBE    = (UseBreakEven && profitR >= BreakEvenAtR);
-      bool wantTrail = (UseTrailingStop && profitR >= TrailStartR);
-      if(!wantBE && !wantTrail) continue;
 
       double ts      = SymTickSize(sym);
       double point   = SymbolInfoDouble(sym, SYMBOL_POINT);
@@ -1479,13 +1684,103 @@ void ManageOpenPositions()
       if(spread < 0) spread = 0;
       double minDist = MinStopDistance(sym, bid, ask, 1);
       double freezeD = (double)SymbolInfoInteger(sym, SYMBOL_TRADE_FREEZE_LEVEL) * point;
+
+      // ---- v1.27: partial close at PartialCloseAtR (banks profit, never adds risk) ----
+      bool partialDone = GlobalVariableCheck(PartialGVName(ticket));
+      if(UsePartialClose && !partialDone && profitR >= PartialCloseAtR &&
+         PartialClosePercent > 0 && PartialClosePercent < 100)
+      {
+         double minLot = SymbolInfoDouble(sym, SYMBOL_VOLUME_MIN);
+         double vStep  = SymbolInfoDouble(sym, SYMBOL_VOLUME_STEP);
+         double closeVol = NormalizeLot(sym, lot * PartialClosePercent / 100.0);   // rounded down
+         double rest = lot - closeVol;
+         if(closeVol <= 0 || vStep <= 0 || rest < minLot - vStep * 0.01)
+         {
+            GlobalVariableSet(PartialGVName(ticket), 2);   // 2 = skipped, volume too small to split
+            Print(sym, " #", ticket, " partial close skipped: lot ", lot, " cannot be split (min ", minLot,
+                  ", step ", vStep, ") - full position keeps running");
+         }
+         else
+         {
+            bool hedging = (AccountInfoInteger(ACCOUNT_MARGIN_MODE) == ACCOUNT_MARGIN_MODE_RETAIL_HEDGING);
+            if(!hedging)
+            {
+               // CTrade partial close is hedging-only; never send an opposite deal on netting
+               GlobalVariableSet(PartialGVName(ticket), 4);   // 4 = skipped, netting account
+               Print(sym, " #", ticket, " partial close skipped: account is not hedging - full position keeps running");
+               continue;
+            }
+            SetFillingForSymbol(sym);
+            bool pok = trade.PositionClosePartial(ticket, closeVol, (ulong)Slippage);
+            uint prc = trade.ResultRetcode();
+            if(pok && (prc == TRADE_RETCODE_DONE || prc == TRADE_RETCODE_DONE_PARTIAL || prc == TRADE_RETCODE_PLACED))
+            {
+               GlobalVariableSet(PartialGVName(ticket), 1);
+               Print(sym, " #", ticket, " partial close ", closeVol, " of ", lot, " at ",
+                     DoubleToString(profitR, 2), "R - rest runs");
+            }
+            else
+            {
+               modStates[ms].partialFails++;
+               Print(sym, " #", ticket, " partial close failed (", prc, " ", trade.ResultRetcodeDescription(),
+                     ") try ", modStates[ms].partialFails);
+               if(modStates[ms].partialFails >= 3)
+                  GlobalVariableSet(PartialGVName(ticket), 3);  // 3 = gave up, stop retrying
+            }
+         }
+         modStates[ms].nextAllowed = now + ModifyMinSeconds;   // re-read the position next pass
+         continue;
+      }
+
+      // ---- v1.27: runner TP: after a real partial close, push TP out to MaxTP_R ----
+      if(RunnerRemoveTP && MaxTP_R > 0 && currentTP > 0 &&
+         GlobalVariableCheck(PartialGVName(ticket)) && GlobalVariableGet(PartialGVName(ticket)) == 1 &&
+         !GlobalVariableCheck(RunnerGVName(ticket)))
+      {
+         double farTP = (type == POSITION_TYPE_BUY ? RoundToTick(sym, openPrice + MaxTP_R * rDist, 1)
+                                                   : RoundToTick(sym, openPrice - MaxTP_R * rDist, -1));
+         bool further = (type == POSITION_TYPE_BUY ? farTP > currentTP + ts * 0.5
+                                                   : (farTP < currentTP - ts * 0.5 && farTP > 0));
+         bool tpFrozen = (freezeD > 0 && MathAbs((type == POSITION_TYPE_BUY ? bid : ask) - currentTP) <= freezeD);
+         if(!further)
+            GlobalVariableSet(RunnerGVName(ticket), 1);   // TP already at/after MaxTP_R
+         else if(!tpFrozen)
+         {
+            bool tok = trade.PositionModify(ticket, currentSL, farTP);
+            uint trc = trade.ResultRetcode();
+            if(tok && (trc == TRADE_RETCODE_DONE || trc == TRADE_RETCODE_NO_CHANGES))
+            {
+               GlobalVariableSet(RunnerGVName(ticket), 1);
+               modStates[ms].fails = 0;
+               modStates[ms].nextAllowed = now + ModifyMinSeconds;
+               Print(sym, " #", ticket, " runner TP moved to ", farTP, " (", DoubleToString(MaxTP_R, 1), "R)");
+            }
+            else
+            {
+               modStates[ms].fails++;
+               int f2 = modStates[ms].fails;
+               if(f2 > 10) f2 = 10;
+               int w2 = (int)MathMin((double)ModifyMaxBackoffSec, (double)ModifyMinSeconds * MathPow(2.0, f2));
+               if(w2 < 1) w2 = 1;
+               modStates[ms].nextAllowed = now + w2;
+               if(modStates[ms].fails >= 5) GlobalVariableSet(RunnerGVName(ticket), 2);   // give up on TP move
+               Print(sym, " #", ticket, " runner TP move rejected (", trc, " ",
+                     trade.ResultRetcodeDescription(), ") - next try in ", w2, "s");
+            }
+            continue;
+         }
+      }
+
+      bool wantBE    = (UseBreakEven && profitR >= BreakEvenAtR);
+      bool wantTrail = (UseTrailingStop && profitR >= TrailStartR);
+      if(!wantBE && !wantTrail) continue;
       double minImprove = MoneyToPriceDistance(sym, lot, TrailMinImproveMoney);
       if(minImprove < ts) minImprove = ts;
 
       double beLock = BreakEvenLockR * rDist + spread;
       double trailDist = 0;
       int si = FindSymbolIndex(sym);
-      if(si >= 0) trailDist = TrailATRMult * GetBufVal(symbols[si].atrHandle, 1);
+      if(si >= 0) trailDist = TrailATRMult * GetBufVal(symbols[si].atrTrailHandle, 1);
       if(trailDist <= 0) wantTrail = false;
 
       double newSL = 0;

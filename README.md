@@ -1,8 +1,29 @@
-# Deriv-SMC-EA v1.26
+# Deriv-SMC-EA v1.27
 
 **Multi-Pair MT5 Expert Advisor**  
 Strategies: **CRT → Rejection Block → Order Block**  
 with an H1 trend filter, setup-timeframe market structure, and 1-minute market-entry timing.
+
+### New in v1.27
+- **Bigger targets**: `RR_Ratio` is now 3.0 (was 2.0).
+- **Structure TP from the setup chart** (`UseStructureTP`): TP goes to the nearest swing high (buys) or swing low (sells) on the same chart the setup came from (`EntryTF`, M5), looking back `StructureTPLookback` (100) bars. The swing is only used if it is at least `MinTP_R` (2.5R) away. TP is set `StructureTPBufferATR` (0.1) × ATR before the swing so it fills, and it is capped at `MaxTP_R` (6R). If there is no such swing, TP = `RR_Ratio` × SL distance. The TP never changes the SL or the lot size, so the $ risk is the same.
+- **Deep limit TP**: the TP is placed where a market entry's TP would have been (or further). That is at least `RR_Ratio` × the normal 1.5 ATR SL distance from the limit price, so a tight-stop limit gets a big R.
+- **Let winners run**:
+  - Break-even moves at `BreakEvenAtR` 1.5R (was 1.0) and locks `BreakEvenLockR` 0.3R (was 0.1).
+  - Trailing starts at `TrailStartR` 2.0R (was 1.5) and trails `TrailATRMult` 2.0 (was 1.5) × ATR(`TrailATRTF`, M5 by default).
+- **Partial close** (`UsePartialClose`): at `PartialCloseAtR` (2R) it closes `PartialClosePercent` (50%) and the rest keeps running.
+  - It is skipped safely if the lot can't be split into min-lot steps (for example, a min-lot trade), or if the account is netting.
+  - It runs once per trade and is remembered across restarts.
+- **Runner TP** (`RunnerRemoveTP`, off by default): after a real partial close, the TP is moved out to `MaxTP_R` from entry.
+- **Entry alignment** (`UseEntryAlignment`): this check runs right before ANY order (market or deep limit). For a BUY:
+  - the last closed M1 bar is bullish and closes above the prior M1 high
+  - M1 EMA `AlignFastEMA` (9) is above EMA `AlignSlowEMA` (21)
+  - bid is above the 9 EMA
+  - price is not more than `MaxChaseATR` × ATR past the setup zone
+
+  A SELL is the mirror. If any rule fails, the setup waits up to `AlignWaitBars` (5) M1 bars, then it is dropped with the reason in the log.
+- All v1.25/v1.26 safety stays the same: strict $ risk with the `OrderCalcProfit` check, broker min distance, invalid-stops cooldown, modify throttle and back-off, daily $ stop, symbol pause, spike filter, deep limit fallback.
+- **Gold note**: if XAUUSD never trades, the min lot at a 1.5 ATR M5 stop probably risks more than $3. `CustomRiskList = XAUUSD:5` would allow it (at $5 risk).
 
 ### New in v1.26
 - **Spike-direction filter** (`UseSpikeDirectionFilter`): no SELLs on Boom or DEX … UP, and no BUYs on Crash or DEX … DOWN. These are the trades that got run through their SL by spikes.
