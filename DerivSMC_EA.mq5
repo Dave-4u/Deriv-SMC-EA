@@ -5,10 +5,12 @@
 //|  v1.26: spike filter, R-based exits, daily/symbol loss stops    |
 //|  v1.27: structure TP, bigger RR, partial close + runner         |
 //|  v1.28: TP = pair structure (no fixed R), H1 fallback, runner   |
+//|  v1.29: stability + room filters, confluence score, sessions/   |
+//|         news (non-synthetics), adaptive pause by symbol/setup   |
 //+------------------------------------------------------------------+
 #property copyright "Dave-4u"
 #property link      "https://github.com/Dave-4u/Deriv-SMC-EA"
-#property version   "1.28"
+#property version   "1.29"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -62,6 +64,43 @@ input bool     UseEntryAlignment     = true;       // Before ANY order: M1 must 
 input int      AlignFastEMA          = 9;          // M1 fast EMA (buy: fast > slow and bid > fast)
 input int      AlignSlowEMA          = 21;         // M1 slow EMA
 input int      AlignWaitBars         = 5;          // Not aligned: wait this many M1 bars, then drop the setup
+
+input group "=== STABILITY FILTER (v1.29) ==="
+input bool     UseStabilityFilter    = true;       // Skip entries when the setup chart is unstable (surge, chop, wicks)
+input int      StabilityATRBars      = 50;         // Bars for the average ATR on the setup chart
+input double   MaxATRSurge           = 1.8;        // Skip if ATR now > this x its average (volatility surge; 0 = off)
+input double   MinADX                = 18.0;       // Skip if ADX(14) on the setup chart is below this (choppy; 0 = off)
+input int      WickBars              = 5;          // Recent closed setup-chart bars checked for wicks
+input double   MaxWickRatio          = 0.65;       // Skip if wicks average more than this share of the bar range (0 = off)
+
+input group "=== ROOM TO MOVE FILTER (v1.29) ==="
+input bool     UseRoomToMoveFilter   = true;       // Skip a buy under nearby resistance / a sell above nearby support
+input double   MinRoomR              = 1.5;        // Need at least this x R to the next unbroken opposing swing
+input double   AtLevelATR            = 0.3;        // Also skip if price sits within this x ATR of resistance/support
+
+input group "=== CONFLUENCE SCORE (v1.29) ==="
+input bool     UseConfluenceScore    = true;       // Need MinConfluenceScore of 7 checks before an entry
+input int      MinConfluenceScore    = 6;          // Points needed of 7 (5 are already forced by the default hard filters)
+input int      SweepBars             = 10;         // Liquidity sweep: setup-chart bars checked for a wick through a swing
+input int      SweepRefBars          = 20;         // Bars before that wick that define the swept high/low
+input int      PDRangeBars           = 50;         // Range for premium/discount (buy in lower half, sell in upper half)
+
+input group "=== SESSION & NEWS (v1.29, not synthetics) ==="
+input bool     UseSessionFilter      = true;       // Forex/gold/crypto only: hours, rollover, sessions, news (synthetics skip)
+input string   BlockedHours          = "";         // Server-time ranges to skip, e.g. 12:25-12:45,14:25-14:45
+input int      RolloverSkipMinutes   = 30;         // Skip this many minutes after server midnight (wide spreads)
+input bool     UseTradingSessions    = false;      // Forex/gold: only trade inside TradingSessions
+input string   TradingSessions       = "07:00-20:00"; // Server-time sessions (London + New York)
+input bool     UseCalendarNews       = true;       // Skip high-impact MT5 calendar news for the symbol's currencies
+input int      NewsMinutes           = 30;         // Minutes before/after a high-impact event
+
+input group "=== ADAPTIVE PAUSE (v1.29) ==="
+input bool     UseAdaptivePause      = true;       // Pause a symbol or setup type that is losing lately
+input int      PerfTrades            = 10;         // Judge the last this many closed trades of the symbol / setup type
+input int      PerfMinTrades         = 5;          // Need at least this many closed trades before judging
+input double   PerfMinWinRate        = 40.0;       // Pause if net loss AND win rate below this %
+input int      PerfPauseHours        = 0;          // Pause length after the last trade (0 = rest of that server day)
+input int      PerfLookbackDays      = 7;          // Days of history scanned (also after a restart)
 
 input group "=== M1 ENTRY TIMING ==="
 input bool     UseM1EntryTiming      = true;       // If false, enter at market when the setup appears
@@ -133,6 +172,8 @@ struct SymbolData
    int      alignWait;      // v1.27: M1 bars waited for alignment (0 = not waiting)
    bool     alignFailed;    // v1.27: last OpenTrade stopped only because not aligned
    string   alignReason;    // v1.27: why it was not aligned
+   int      adxHandle;      // v1.29: ADX(14) on EntryTF (stability filter)
+   datetime perfPausedUntil; // v1.29: adaptive pause for this symbol
    int      consecLosses;   // v1.26: losses in a row
    datetime pausedUntil;    // v1.26: per-symbol loss pause
    int      pendingSignal;
@@ -157,6 +198,9 @@ struct ModifyState
 ModifyState modStates[];
 bool       dailyStopActive = false;
 bool       plDirty = true;
+bool       perfDirty = true;           // v1.29: rebuild adaptive-pause stats
+datetime   lastPerfCalc = 0;
+datetime   setupPausedUntil[4];        // v1.29: adaptive pause per setup type (1 CRT, 2 Rejection, 3 OB)
 double     todayClosedPL = 0;
 datetime   lastPLCalc = 0;
 
@@ -294,6 +338,8 @@ int OnInit()
       symbols[symbolCount].atrTrailHandle = INVALID_HANDLE;
       symbols[symbolCount].emaFastXHandle = INVALID_HANDLE;
       symbols[symbolCount].emaSlowXHandle = INVALID_HANDLE;
+      symbols[symbolCount].adxHandle = INVALID_HANDLE;
+      symbols[symbolCount].perfPausedUntil = 0;
       symbols[symbolCount].alignWait = 0;
       symbols[symbolCount].alignFailed = false;
       symbols[symbolCount].alignReason = "";
@@ -331,11 +377,12 @@ int OnInit()
       int atrTHandle = iATR(baseSymbols[i], TrailATRTF, 14);
       int emaFXHandle = iMA(baseSymbols[i], ExecTF, (AlignFastEMA > 0 ? AlignFastEMA : 9),  0, MODE_EMA, PRICE_CLOSE);
       int emaSXHandle = iMA(baseSymbols[i], ExecTF, (AlignSlowEMA > 0 ? AlignSlowEMA : 21), 0, MODE_EMA, PRICE_CLOSE);
+      int adxHandle   = iADX(baseSymbols[i], EntryTF, 14);
 
       if(atrHandle == INVALID_HANDLE || emaHandle == INVALID_HANDLE ||
          atrXHandle == INVALID_HANDLE || emaCHandle == INVALID_HANDLE ||
          atrTHandle == INVALID_HANDLE || emaFXHandle == INVALID_HANDLE ||
-         emaSXHandle == INVALID_HANDLE)
+         emaSXHandle == INVALID_HANDLE || adxHandle == INVALID_HANDLE)
       {
          Print("Failed to create handles for ", baseSymbols[i]);
          if(atrHandle  != INVALID_HANDLE) IndicatorRelease(atrHandle);
@@ -345,6 +392,7 @@ int OnInit()
          if(atrTHandle != INVALID_HANDLE) IndicatorRelease(atrTHandle);
          if(emaFXHandle != INVALID_HANDLE) IndicatorRelease(emaFXHandle);
          if(emaSXHandle != INVALID_HANDLE) IndicatorRelease(emaSXHandle);
+         if(adxHandle   != INVALID_HANDLE) IndicatorRelease(adxHandle);
          continue;
       }
 
@@ -355,6 +403,7 @@ int OnInit()
       symbols[symbolCount].atrTrailHandle = atrTHandle;
       symbols[symbolCount].emaFastXHandle = emaFXHandle;
       symbols[symbolCount].emaSlowXHandle = emaSXHandle;
+      symbols[symbolCount].adxHandle = adxHandle;
       symbolCount++;
    }
 
@@ -373,8 +422,10 @@ int OnInit()
    dailyStartDate = TimeCurrent();
 
    RebuildLossPauses();
+   for(int t = 0; t < 4; t++) setupPausedUntil[t] = 0;
+   RebuildPerformance();
 
-   Print("=== DerivSMC_EA v1.28 Started ===");
+   Print("=== DerivSMC_EA v1.29 Started ===");
    Print("Symbols loaded: ", symbolCount,
          " | from file=", (SymbolsFromFile ? SymbolsFile : "SymbolsList"),
          " | Structure=", UseMarketStructure,
@@ -386,7 +437,10 @@ int OnInit()
          " (min ", MinTP_R, "R, cap ", (MaxTP_R > 0 ? DoubleToString(MaxTP_R, 1) + "R" : "none"),
          ", HTF ", EnumToString(StructureTPHTF), ") | partial=", UsePartialClose,
          " @", PartialCloseAtR, "R ", PartialClosePercent, "%",
-         " | alignment=", UseEntryAlignment, " (wait ", AlignWaitBars, " M1 bars)");
+         " | alignment=", UseEntryAlignment, " (wait ", AlignWaitBars, " M1 bars)",
+         " | stability=", UseStabilityFilter, " | room=", UseRoomToMoveFilter, " (", MinRoomR, "R)",
+         " | confluence=", (UseConfluenceScore ? IntegerToString(MinConfluenceScore) + "/7" : "off"),
+         " | session/news=", UseSessionFilter, " | adaptive pause=", UseAdaptivePause);
    for(int i=0; i<symbolCount; i++)
       Print("  → ", symbols[i].name, " | Risk: $", symbols[i].risk);
 
@@ -405,6 +459,7 @@ void OnDeinit(const int reason)
       if(symbols[i].atrTrailHandle != INVALID_HANDLE) IndicatorRelease(symbols[i].atrTrailHandle);
       if(symbols[i].emaFastXHandle != INVALID_HANDLE) IndicatorRelease(symbols[i].emaFastXHandle);
       if(symbols[i].emaSlowXHandle != INVALID_HANDLE) IndicatorRelease(symbols[i].emaSlowXHandle);
+      if(symbols[i].adxHandle != INVALID_HANDLE) IndicatorRelease(symbols[i].adxHandle);
    }
    Print("DerivSMC_EA removed");
 }
@@ -420,6 +475,13 @@ void OnTick()
    {
       lastGVClean = TimeCurrent();
       CleanupRiskGlobals();
+   }
+
+   if(UseAdaptivePause)
+   {
+      datetime nowP = TimeCurrent();
+      if((perfDirty && nowP - lastPerfCalc >= 5) || nowP - lastPerfCalc >= 600)
+         RebuildPerformance();
    }
 
    if(!CheckDailyLossLimit()) return;
@@ -512,6 +574,11 @@ void OnTick()
          ClearPending(i);
          continue;
       }
+      if(UseAdaptivePause && setupType >= 1 && setupType <= 3 && setupPausedUntil[setupType] > TimeCurrent())
+      {
+         ClearPending(i);
+         continue;   // v1.29: this setup type is paused (losing lately)
+      }
 
       symbols[i].pendingType = setupType;
       double zLo = 0, zHi = 0;
@@ -540,6 +607,7 @@ bool IsSymbolBlocked(int idx)
    datetime now = TimeCurrent();
    if(symbols[idx].blockedUntil > 0 && now < symbols[idx].blockedUntil) return true;
    if(symbols[idx].pausedUntil  > 0 && now < symbols[idx].pausedUntil)  return true;
+   if(UseAdaptivePause && symbols[idx].perfPausedUntil > 0 && now < symbols[idx].perfPausedUntil) return true;
    return false;
 }
 
@@ -963,6 +1031,7 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
    if(!HistoryDealSelect(trans.deal)) return;
    ProcessClosedDeal(trans.deal, true);
    plDirty = true;
+   perfDirty = true;
 }
 
 //------------------- INITIAL RISK PER TICKET (v1.26) -----------------
@@ -1262,6 +1331,438 @@ bool EntryAligned(int idx, int signal, double bid, double ask, double atrE, stri
    return true;
 }
 
+//------------------- STABILITY + ROOM FILTERS (v1.29) ---------------
+// Unstable setup chart (EntryTF, closed bars): volatility surge, chop, or wicks.
+bool IsUnstable(int idx, string &why)
+{
+   why = "";
+   string sym = symbols[idx].name;
+
+   // a) Volatility surge: ATR(14) of the last closed bar vs its average
+   if(MaxATRSurge > 0 && StabilityATRBars > 1)
+   {
+      double a[];
+      int got = CopyBuffer(symbols[idx].atrHandle, 0, 1, StabilityATRBars, a);
+      if(got >= 2)
+      {
+         double sum = 0;
+         for(int i = 0; i < got; i++) sum += a[i];
+         double avg = sum / got;
+         double now = a[got - 1];             // not series: last element = shift 1
+         if(avg > 0 && now > MaxATRSurge * avg)
+         {
+            why = "volatility surge (ATR " + DoubleToString(now / avg, 2) + "x average)";
+            return true;
+         }
+      }
+   }
+
+   // b) Chop: ADX(14) below MinADX = no clean trend on the setup chart
+   if(MinADX > 0)
+   {
+      double adx = GetBufVal(symbols[idx].adxHandle, 1);
+      if(adx > 0 && adx < MinADX)
+      {
+         why = "choppy (ADX " + DoubleToString(adx, 1) + " < " + DoubleToString(MinADX, 1) + ")";
+         return true;
+      }
+   }
+
+   // c) Wicks: average wick share of the bar range over the last WickBars bars
+   if(MaxWickRatio > 0 && WickBars > 0)
+   {
+      double sumR = 0;
+      int cnt = 0;
+      for(int b = 1; b <= WickBars; b++)
+      {
+         double h = iHigh(sym, EntryTF, b), l = iLow(sym, EntryTF, b);
+         double o = iOpen(sym, EntryTF, b), c = iClose(sym, EntryTF, b);
+         double rng = h - l;
+         if(h <= 0 || l <= 0 || rng <= 0) continue;
+         sumR += (rng - MathAbs(c - o)) / rng;
+         cnt++;
+      }
+      if(cnt > 0 && sumR / cnt > MaxWickRatio)
+      {
+         why = "wicky bars (wicks " + DoubleToString(100.0 * sumR / cnt, 0) + "% of range)";
+         return true;
+      }
+   }
+   return false;
+}
+
+// Buy: unbroken swing high (setup chart or StructureTPHTF) closer than MinRoomR x R
+// above entry, or price within AtLevelATR x ATR of one. Sell: mirror with support.
+bool NoRoomToMove(string sym, int signal, double entry, double rD, double atrE, string &why)
+{
+   why = "";
+   bool highs = (signal == 1);
+   double tol = (AtLevelATR > 0 ? AtLevelATR * atrE : 0);
+   double need = MinRoomR * rD;
+   for(int pass = 0; pass < 2; pass++)
+   {
+      ENUM_TIMEFRAMES tf = (pass == 0 ? EntryTF : StructureTPHTF);
+      int lb = (pass == 0 ? StructureTPLookback : StructureTPHTFLookback);
+      double levels[];
+      ArrayResize(levels, 0);
+      CollectStructureLevels(sym, tf, highs, lb, true, levels);
+      int n = ArraySize(levels);
+      for(int i = 0; i < n; i++)
+      {
+         double d = (signal == 1 ? levels[i] - entry : entry - levels[i]);   // >0 = level ahead
+         string what = (signal == 1 ? "resistance " : "support ") + DoubleToString(levels[i], 5) +
+                       " on " + EnumToString(tf);
+         if(tol > 0 && MathAbs(d) <= tol)
+         {
+            why = "price sitting at " + what;
+            return true;
+         }
+         if(need > 0 && d > 0 && d < need)
+         {
+            why = what + " only " + DoubleToString(d / rD, 2) + "R away (need " + DoubleToString(MinRoomR, 1) + "R)";
+            return true;
+         }
+      }
+   }
+   return false;
+}
+
+//------------------- CONFLUENCE SCORE (v1.29) -----------------------
+// Liquidity sweep: a recent setup-chart bar wicked through the prior swing
+// (low for buys, high for sells) and closed back inside.
+bool HasLiquiditySweep(string sym, int signal)
+{
+   int sb = (SweepBars > 0 ? SweepBars : 10);
+   int rb = (SweepRefBars > 1 ? SweepRefBars : 20);
+   for(int b = 1; b <= sb; b++)
+   {
+      double c = iClose(sym, EntryTF, b);
+      if(c <= 0) continue;
+      if(signal == 1)
+      {
+         int k = iLowest(sym, EntryTF, MODE_LOW, rb, b + 1);
+         if(k < 0) continue;
+         double ref = iLow(sym, EntryTF, k);
+         double l = iLow(sym, EntryTF, b);
+         if(ref > 0 && l > 0 && l < ref && c > ref) return true;
+      }
+      else
+      {
+         int k = iHighest(sym, EntryTF, MODE_HIGH, rb, b + 1);
+         if(k < 0) continue;
+         double ref = iHigh(sym, EntryTF, k);
+         double h = iHigh(sym, EntryTF, b);
+         if(ref > 0 && h > 0 && h > ref && c < ref) return true;
+      }
+   }
+   return false;
+}
+
+// Buy in the lower half (discount) / sell in the upper half (premium) of the recent range
+bool InDiscountPremium(string sym, int signal, double price)
+{
+   int n = (PDRangeBars > 2 ? PDRangeBars : 50);
+   int hi = iHighest(sym, EntryTF, MODE_HIGH, n, 1);
+   int lo = iLowest(sym, EntryTF, MODE_LOW, n, 1);
+   if(hi < 0 || lo < 0) return false;
+   double h = iHigh(sym, EntryTF, hi), l = iLow(sym, EntryTF, lo);
+   if(h <= 0 || l <= 0 || h <= l) return false;
+   double mid = (h + l) / 2.0;
+   return (signal == 1 ? price < mid : price > mid);
+}
+
+void AddMissing(string &missing, string item)
+{
+   if(missing != "") missing += ", ";
+   missing += item;
+}
+
+// 7 checks, 1 point each. 'missing' lists the ones that failed.
+int ConfluenceScore(int idx, int signal, double bid, double ask, double price, double rD, double atrE, string &missing)
+{
+   missing = "";
+   string sym = symbols[idx].name;
+   int score = 0;
+   string tmp = "";
+
+   if(GetTrendDirection(idx) == signal && GetConfirmTrend(idx) == signal) score++; else AddMissing(missing, "H1+M15 trend");
+   if(GetMarketStructure(sym) == signal) score++; else AddMissing(missing, "structure");
+
+   bool m1 = ExecBarConfirms(sym, signal);
+   if(m1)
+   {
+      double f = GetBufVal(symbols[idx].emaFastXHandle, 1);
+      double sl = GetBufVal(symbols[idx].emaSlowXHandle, 1);
+      m1 = (f > 0 && sl > 0 && (signal == 1 ? (f > sl && bid > f) : (f < sl && ask < f)));
+   }
+   if(m1) score++; else AddMissing(missing, "M1 alignment");
+
+   if(HasLiquiditySweep(sym, signal)) score++; else AddMissing(missing, "liquidity sweep");
+   if(!IsUnstable(idx, tmp)) score++; else AddMissing(missing, "stability");
+   if(!NoRoomToMove(sym, signal, price, rD, atrE, tmp)) score++; else AddMissing(missing, "room to move");
+   if(InDiscountPremium(sym, signal, price)) score++; else AddMissing(missing, (signal == 1 ? "discount" : "premium"));
+   return score;
+}
+
+//------------------- SESSION & NEWS (v1.29) --------------------------
+bool IsSyntheticSymbol(string sym)
+{
+   if(IsSpikeSymbol(sym)) return true;
+   string u = UpperName(sym);
+   if(StringFind(u, " INDEX") >= 0) return true;          // Volatility / Step / Range Break / DEX ...
+   string path = SymbolInfoString(sym, SYMBOL_PATH);
+   StringToUpper(path);
+   return (StringFind(path, "SYNTH") >= 0 || StringFind(path, "DERIVED") >= 0);
+}
+
+bool IsCryptoSymbol(string sym)
+{
+   string path = SymbolInfoString(sym, SYMBOL_PATH);
+   StringToUpper(path);
+   if(StringFind(path, "CRYPTO") >= 0) return true;
+   string b = SymbolInfoString(sym, SYMBOL_CURRENCY_BASE);
+   StringToUpper(b);
+   return (b == "BTC" || b == "ETH" || b == "LTC" || b == "XRP" || b == "BCH" ||
+           b == "SOL" || b == "DOGE" || b == "ADA" || b == "DOT" || b == "BNB");
+}
+
+// "HH:MM" -> minute of day, -1 if invalid
+int ParseHM(string t)
+{
+   StringTrimLeft(t);
+   StringTrimRight(t);
+   string hm[];
+   if(StringSplit(t, ':', hm) != 2) return -1;
+   int h = (int)StringToInteger(hm[0]);
+   int m = (int)StringToInteger(hm[1]);
+   if(h < 0 || h > 24 || m < 0 || m > 59) return -1;
+   return h * 60 + m;
+}
+
+// true if minute-of-day 'mod' is inside any "HH:MM-HH:MM" range (wraps past midnight)
+bool InTimeRanges(string list, int mod)
+{
+   string parts[];
+   int k = StringSplit(list, ',', parts);
+   for(int i = 0; i < k; i++)
+   {
+      string ab[];
+      if(StringSplit(parts[i], '-', ab) != 2) continue;
+      int a = ParseHM(ab[0]);
+      int b = ParseHM(ab[1]);
+      if(a < 0 || b < 0 || a == b) continue;
+      if(a < b) { if(mod >= a && mod < b) return true; }
+      else      { if(mod >= a || mod < b) return true; }
+   }
+   return false;
+}
+
+// High-impact MT5 calendar event for the symbol's currencies within +/- NewsMinutes.
+// Fails open: if the calendar is unavailable nothing is blocked.
+bool CalendarNewsNear(string sym, string &what)
+{
+   what = "";
+   datetime now = TimeTradeServer();
+   if(now <= 0) now = TimeCurrent();
+   int win = (NewsMinutes > 0 ? NewsMinutes : 30) * 60;
+   string cur[2];
+   cur[0] = SymbolInfoString(sym, SYMBOL_CURRENCY_BASE);
+   cur[1] = SymbolInfoString(sym, SYMBOL_CURRENCY_PROFIT);
+   for(int c = 0; c < 2; c++)
+   {
+      if(cur[c] == "" || (c == 1 && cur[1] == cur[0])) continue;
+      MqlCalendarValue vals[];
+      ResetLastError();
+      if(!CalendarValueHistory(vals, now - win, now + win, NULL, cur[c])) continue;   // fail open
+      int n = ArraySize(vals);
+      for(int v = 0; v < n; v++)
+      {
+         MqlCalendarEvent ev;
+         if(!CalendarEventById(vals[v].event_id, ev)) continue;
+         if(ev.importance != CALENDAR_IMPORTANCE_HIGH) continue;
+         what = cur[c] + " " + ev.name + " at " + TimeToString(vals[v].time, TIME_MINUTES);
+         return true;
+      }
+   }
+   return false;
+}
+
+bool SessionBlocked(string sym, string &why)
+{
+   why = "";
+   if(IsSyntheticSymbol(sym)) return false;               // synthetics trade 24/7
+   long nowL = (long)TimeCurrent();
+   int mod = (int)((nowL % 86400) / 60);                  // server minute of day
+   if(RolloverSkipMinutes > 0 && mod < RolloverSkipMinutes)
+   {
+      why = "first " + IntegerToString(RolloverSkipMinutes) + " min after server rollover";
+      return true;
+   }
+   if(StringLen(BlockedHours) > 0 && InTimeRanges(BlockedHours, mod))
+   {
+      why = "inside BlockedHours (" + BlockedHours + ")";
+      return true;
+   }
+   if(UseTradingSessions && StringLen(TradingSessions) > 0 && !IsCryptoSymbol(sym) &&
+      !InTimeRanges(TradingSessions, mod))
+   {
+      why = "outside TradingSessions (" + TradingSessions + ")";
+      return true;
+   }
+   if(UseCalendarNews)
+   {
+      string ev = "";
+      if(CalendarNewsNear(sym, ev))
+      {
+         why = "high-impact news " + ev;
+         return true;
+      }
+   }
+   return false;
+}
+
+//------------------- ADAPTIVE PAUSE (v1.29) --------------------------
+string SetupTag(int t)
+{
+   if(t >= 1 && t <= 3) return " T" + IntegerToString(t);
+   return "";
+}
+
+int SetupFromComment(string c)
+{
+   int p = StringFind(c, " T");
+   if(p < 0 || p + 2 >= StringLen(c)) return 0;
+   int t = (int)StringToInteger(StringSubstr(c, p + 2, 1));
+   return ((t >= 1 && t <= 3) ? t : 0);
+}
+
+string SetupName(int t)
+{
+   if(t == 1) return "CRT";
+   if(t == 2) return "Rejection Block";
+   if(t == 3) return "Order Block";
+   return "unknown";
+}
+
+// Judge the newest PerfTrades closed trades in order[] matching sym ("" = any) and type (0 = any).
+// Returns the pause end (0 = no pause) and fills a short summary.
+datetime JudgeGroup(int &order[], string &psym[], int &ptype[], double &ppl[], datetime &pclose[],
+                    string sym, int type, string &summary)
+{
+   summary = "";
+   int cnt = 0, wins = 0;
+   double net = 0;
+   datetime last = 0;
+   int n = ArraySize(order);
+   for(int i = 0; i < n && cnt < PerfTrades; i++)
+   {
+      int k = order[i];
+      if(sym != "" && psym[k] != sym) continue;
+      if(type != 0 && ptype[k] != type) continue;
+      cnt++;
+      net += ppl[k];
+      if(ppl[k] > 0) wins++;
+      if(pclose[k] > last) last = pclose[k];
+   }
+   if(cnt < PerfMinTrades || cnt <= 0) return 0;
+   double wr = 100.0 * wins / cnt;
+   summary = "last " + IntegerToString(cnt) + " trades net $" + DoubleToString(net, 2) +
+             ", win rate " + DoubleToString(wr, 0) + "%";
+   if(net >= 0 || wr >= PerfMinWinRate) return 0;
+   long lastL = (long)last;
+   if(PerfPauseHours > 0) return (datetime)(lastL + (long)PerfPauseHours * 3600);
+   return (datetime)(lastL - lastL % 86400 + 86400);      // end of that server day
+}
+
+// Rebuild per-symbol and per-setup results from deal history (survives restart)
+void RebuildPerformance()
+{
+   lastPerfCalc = TimeCurrent();
+   perfDirty = false;
+   if(!UseAdaptivePause) return;
+   datetime now = TimeCurrent();
+   int days = (PerfLookbackDays > 0 ? PerfLookbackDays : 7);
+   if(!HistorySelect(now - days * 86400, now + 60)) return;
+
+   ulong    ids[];
+   string   psym[];
+   int      ptype[];
+   double   ppl[];
+   datetime pclose[];
+   int m = 0;
+   int nd = HistoryDealsTotal();
+   for(int i = 0; i < nd; i++)
+   {
+      ulong d = HistoryDealGetTicket(i);
+      if(d == 0) continue;
+      if(HistoryDealGetInteger(d, DEAL_MAGIC) != MagicNumber) continue;
+      long dtype = HistoryDealGetInteger(d, DEAL_TYPE);
+      if(dtype != DEAL_TYPE_BUY && dtype != DEAL_TYPE_SELL) continue;
+      ulong pid = (ulong)HistoryDealGetInteger(d, DEAL_POSITION_ID);
+      if(pid == 0) continue;
+      int k = -1;
+      for(int j = 0; j < m; j++) if(ids[j] == pid) { k = j; break; }
+      if(k < 0)
+      {
+         k = m; m++;
+         ArrayResize(ids, m); ArrayResize(psym, m); ArrayResize(ptype, m);
+         ArrayResize(ppl, m); ArrayResize(pclose, m);
+         ids[k] = pid; psym[k] = HistoryDealGetString(d, DEAL_SYMBOL);
+         ptype[k] = 0; ppl[k] = 0; pclose[k] = 0;
+      }
+      long entry = HistoryDealGetInteger(d, DEAL_ENTRY);
+      if(entry == DEAL_ENTRY_IN)
+      {
+         int t = SetupFromComment(HistoryDealGetString(d, DEAL_COMMENT));
+         if(t == 0)
+         {
+            ulong o = (ulong)HistoryDealGetInteger(d, DEAL_ORDER);
+            if(o > 0) t = SetupFromComment(HistoryOrderGetString(o, ORDER_COMMENT));
+         }
+         ptype[k] = t;
+      }
+      else if(entry == DEAL_ENTRY_OUT || entry == DEAL_ENTRY_INOUT || entry == DEAL_ENTRY_OUT_BY)
+      {
+         ppl[k] += HistoryDealGetDouble(d, DEAL_PROFIT) + HistoryDealGetDouble(d, DEAL_SWAP)
+                 + HistoryDealGetDouble(d, DEAL_COMMISSION);
+         datetime t2 = (datetime)HistoryDealGetInteger(d, DEAL_TIME);
+         if(t2 > pclose[k]) pclose[k] = t2;
+      }
+   }
+
+   // Fully closed trades only, newest first
+   int order[];
+   int no = 0;
+   for(int k = 0; k < m; k++)
+   {
+      if(pclose[k] == 0) continue;
+      if(PositionSelectByTicket(ids[k])) continue;          // still open (partial so far)
+      ArrayResize(order, no + 1);
+      int j = no - 1;
+      while(j >= 0 && pclose[order[j]] < pclose[k]) { order[j + 1] = order[j]; j--; }
+      order[j + 1] = k;
+      no++;
+   }
+
+   string summary = "";
+   for(int s = 0; s < symbolCount; s++)
+   {
+      datetime until = JudgeGroup(order, psym, ptype, ppl, pclose, symbols[s].name, 0, summary);
+      if(until > now && until != symbols[s].perfPausedUntil)
+         Print(symbols[s].name, " adaptive pause until ", TimeToString(until, TIME_DATE | TIME_MINUTES),
+               " (server): ", summary, " < ", DoubleToString(PerfMinWinRate, 0), "%");
+      symbols[s].perfPausedUntil = (until > now ? until : 0);
+   }
+   for(int t = 1; t <= 3; t++)
+   {
+      datetime until = JudgeGroup(order, psym, ptype, ppl, pclose, "", t, summary);
+      if(until > now && until != setupPausedUntil[t])
+         Print(SetupName(t), " setups adaptive pause until ", TimeToString(until, TIME_DATE | TIME_MINUTES),
+               " (server): ", summary, " < ", DoubleToString(PerfMinWinRate, 0), "%");
+      setupPausedUntil[t] = (until > now ? until : 0);
+   }
+}
+
 //------------------- OPEN TRADE -------------------------------------
 bool OpenTrade(int idx, int signal)
 {
@@ -1271,6 +1772,25 @@ bool OpenTrade(int idx, int signal)
    if(risk <= 0) return false;
    if(SpikeDirectionBlocked(sym, signal)) return false;
    if(IsBigCandle(idx)) return false;
+
+   // v1.29: adaptive pause for this setup type
+   int stype = symbols[idx].pendingType;
+   if(UseAdaptivePause && stype >= 1 && stype <= 3 && setupPausedUntil[stype] > TimeCurrent())
+   {
+      Print(sym, " skipped: ", SetupName(stype), " setups paused until ",
+            TimeToString(setupPausedUntil[stype], TIME_DATE | TIME_MINUTES), " (server)");
+      return false;
+   }
+   // v1.29: session / rollover / news (forex, gold, crypto only)
+   if(UseSessionFilter)
+   {
+      string swhy = "";
+      if(SessionBlocked(sym, swhy))
+      {
+         Print(sym, " ", (signal == 1 ? "BUY" : "SELL"), " skipped: ", swhy);
+         return false;
+      }
+   }
 
    double atr[];
    ArraySetAsSeries(atr, true);
@@ -1304,6 +1824,17 @@ bool OpenTrade(int idx, int signal)
       }
       if(symbols[idx].alignWait > 0)
          Print(sym, " aligned after ", symbols[idx].alignWait, " ", EnumToString(ExecTF), " bars");
+   }
+
+   // v1.29: stability filter (before ANY order)
+   if(UseStabilityFilter)
+   {
+      string uwhy = "";
+      if(IsUnstable(idx, uwhy))
+      {
+         Print(sym, " ", (signal == 1 ? "BUY" : "SELL"), " skipped: unstable - ", uwhy);
+         return false;
+      }
    }
 
    double slDistance = atr[0] * 1.5;
@@ -1343,6 +1874,33 @@ bool OpenTrade(int idx, int signal)
       if(sl <= ask || tp >= bid || tp <= 0) { Print(sym, " SELL skipped: stops on wrong side"); return false; }
    }
 
+   // v1.29: room-to-move filter (before ANY order; R = this setup's SL distance)
+   if(UseRoomToMoveFilter)
+   {
+      string rwhy = "";
+      if(NoRoomToMove(sym, signal, price, MathAbs(price - sl), atr[0], rwhy))
+      {
+         Print(sym, " ", (signal == 1 ? "BUY" : "SELL"), " skipped: no room - ", rwhy);
+         return false;
+      }
+   }
+
+   // v1.29: confluence score (soft: needs MinConfluenceScore of 7)
+   if(UseConfluenceScore)
+   {
+      string missing = "";
+      int score = ConfluenceScore(idx, signal, bid, ask, price, MathAbs(price - sl), atr[0], missing);
+      if(score < MinConfluenceScore)
+      {
+         Print(sym, " ", (signal == 1 ? "BUY" : "SELL"), " skipped: confluence ", score, "/7 < ",
+               MinConfluenceScore, " (missing: ", missing, ")");
+         return false;
+      }
+      string miss = "";
+      if(missing != "") miss = " (missing: " + missing + ")";
+      Print(sym, " confluence ", score, "/7", miss);
+   }
+
    // ---- Lot from the FINAL stop, then hard-verify the $ loss ----
    double perUnit = LossPerPriceUnit(sym);
    if(perUnit <= 0) return false;
@@ -1378,8 +1936,9 @@ bool OpenTrade(int idx, int signal)
    SetFillingForSymbol(sym);
 
    bool ok;
-   if(signal == 1) ok = trade.Buy(lot, sym, price, sl, tp, "SMC Buy");
-   else            ok = trade.Sell(lot, sym, price, sl, tp, "SMC Sell");
+   string tag = SetupTag(symbols[idx].pendingType);   // v1.29: setup type in the comment (adaptive pause)
+   if(signal == 1) ok = trade.Buy(lot, sym, price, sl, tp, "SMC Buy" + tag);
+   else            ok = trade.Sell(lot, sym, price, sl, tp, "SMC Sell" + tag);
 
    uint rc = trade.ResultRetcode();
    if(ok && (rc == TRADE_RETCODE_DONE || rc == TRADE_RETCODE_PLACED || rc == TRADE_RETCODE_DONE_PARTIAL))
@@ -1607,8 +2166,9 @@ bool TryDeepLimit(int idx, int signal, double sl, double bid, double ask, double
 
    trade.SetTypeFilling(ORDER_FILLING_RETURN);   // pending orders
    bool ok;
-   if(signal == 1) ok = trade.BuyLimit(lot, lp, sym, sl, tp, tt, expiry, "SMC DeepLimit");
-   else            ok = trade.SellLimit(lot, lp, sym, sl, tp, tt, expiry, "SMC DeepLimit");
+   string tag = SetupTag(symbols[idx].pendingType);
+   if(signal == 1) ok = trade.BuyLimit(lot, lp, sym, sl, tp, tt, expiry, "SMC DeepLimit" + tag);
+   else            ok = trade.SellLimit(lot, lp, sym, sl, tp, tt, expiry, "SMC DeepLimit" + tag);
    uint rc = trade.ResultRetcode();
    SetFillingForSymbol(sym);
 

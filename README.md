@@ -1,8 +1,36 @@
-# Deriv-SMC-EA v1.28
+# Deriv-SMC-EA v1.29
 
 **Multi-Pair MT5 Expert Advisor**  
 Strategies: **CRT → Rejection Block → Order Block**  
 with an H1 trend filter, setup-timeframe market structure, and 1-minute market-entry timing.
+
+### New in v1.29
+Every filter below has its own on/off switch. Each runs before ANY order (market or deep limit) and logs why a trade was skipped. SL, lot size and $ risk are unchanged.
+- **Stability filter** (`UseStabilityFilter`): skips when the setup chart (M5) is unstable. It checks three things:
+  - **Volatility surge:** ATR(14) is more than `MaxATRSurge` (1.8) × its `StabilityATRBars` (50)-bar average.
+  - **Chop:** ADX(14) is below `MinADX` (18).
+  - **Wicky candles:** over the last `WickBars` (5) bars, wicks average more than `MaxWickRatio` (65%) of the candle range.
+- **Room-to-move filter** (`UseRoomToMoveFilter`): a buy is skipped if an unbroken swing high (resistance) on M5 or H1 is less than `MinRoomR` (1.5R) above entry. It is also skipped if price sits within `AtLevelATR` (0.3) × ATR of such a level. Sells are the mirror, against support.
+- **Confluence score** (`UseConfluenceScore`): the bot needs `MinConfluenceScore` (6) of these 7 points:
+  1. H1 and M15 trend agree
+  2. M5 structure agrees
+  3. M1 alignment
+  4. liquidity sweep: a recent M5 wick through the prior `SweepRefBars` low (buy) or high (sell) that closed back inside
+  5. stable
+  6. room to move
+  7. buy in the lower half (discount) or sell in the upper half (premium) of the last `PDRangeBars` (50) bars
+
+  With the default hard filters on, points 1, 2, 3, 5 and 6 are already required. So 6 means "also needs a liquidity sweep OR a discount/premium entry". Set it to 5 to drop that extra demand. The log shows the score and the missing items.
+- **Session & news** (`UseSessionFilter`): applies to forex, gold and crypto only. Synthetic indices trade 24/7 and skip it.
+  - It skips the first `RolloverSkipMinutes` (30) after server midnight.
+  - It skips any server-time `BlockedHours`, e.g. `12:25-12:45,14:25-14:45`.
+  - `UseTradingSessions` (off) limits forex and gold to `TradingSessions` (07:00-20:00, London + New York).
+  - `UseCalendarNews` skips high-impact MT5 calendar events for the symbol's currencies within ±`NewsMinutes` (30). If the calendar is not available, nothing is blocked.
+- **Adaptive pause** (`UseAdaptivePause`): the bot reviews its own closed trades from history (last `PerfLookbackDays`, 7), so this survives restarts.
+  - It looks at the last `PerfTrades` (10) trades of each symbol, and of each setup type (CRT, Rejection Block, Order Block).
+  - If there are at least `PerfMinTrades` (5), the net is a loss, and the win rate is below `PerfMinWinRate` (40%), that symbol or setup type is paused.
+  - The pause lasts for the rest of that server day, or `PerfPauseHours` after the last trade if that is set.
+  - Order comments now carry the setup type (`SMC Buy T1`, etc.) for this. Trades from before v1.29 count for the symbol but not for a setup type.
 
 ### New in v1.28
 - **TP follows the pair's structure, with no fixed R multiple.** The bot targets the next level price can realistically reach:
