@@ -4,10 +4,11 @@
 //|  Works on Synthetics + Gold + Forex | Fixed $ Risk               |
 //|  v1.26: spike filter, R-based exits, daily/symbol loss stops    |
 //|  v1.27: structure TP, bigger RR, partial close + runner         |
+//|  v1.28: TP = pair structure (no fixed R), H1 fallback, runner   |
 //+------------------------------------------------------------------+
 #property copyright "Dave-4u"
 #property link      "https://github.com/Dave-4u/Deriv-SMC-EA"
-#property version   "1.27"
+#property version   "1.28"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -71,17 +72,19 @@ input double   RR_Ratio              = 3.0;        // TP = this x SL distance wh
 input int      Slippage              = 30;
 
 input group "=== STRUCTURE TAKE-PROFIT (v1.27) ==="
-input bool     UseStructureTP        = true;       // TP at the next swing high/low on the setup chart (EntryTF)
-input int      StructureTPLookback   = 100;        // Bars on the setup chart to look for the target swing
-input double   MinTP_R               = 2.5;        // Swing used only if it is at least this x R away
-input double   MaxTP_R               = 6.0;        // TP never further than this x R (also the runner TP)
-input double   StructureTPBufferATR  = 0.1;        // Put TP this x ATR before the swing so it fills
+input bool     UseStructureTP        = true;       // TP at the pair's next structure level (setup chart, then StructureTPHTF)
+input int      StructureTPLookback   = 100;        // Bars on the setup chart (EntryTF) to look for target swings
+input ENUM_TIMEFRAMES StructureTPHTF = PERIOD_H1;  // Higher chart used when the setup chart has no target
+input int      StructureTPHTFLookback = 100;       // Bars on StructureTPHTF to look for target swings
+input double   MinTP_R               = 2.5;        // Minimum worthwhile target: closer levels are skipped (x R)
+input double   MaxTP_R               = 0.0;        // Optional safety cap in R (0 = no cap, TP goes to structure)
+input double   StructureTPBufferATR  = 0.1;        // Put TP this x ATR before the level so it fills
 
 input group "=== PARTIAL CLOSE & RUNNER (v1.27) ==="
 input bool     UsePartialClose       = true;       // Bank part of the trade at PartialCloseAtR
 input double   PartialCloseAtR       = 2.0;        // Close part when profit >= this x R
 input double   PartialClosePercent   = 50.0;       // % of the volume to close (skipped if lot steps do not allow)
-input bool     RunnerRemoveTP        = false;      // After partial: move TP out to MaxTP_R so the rest can run
+input bool     RunnerRemoveTP        = false;      // After partial: move TP to the next structure level beyond (or MaxTP_R if set)
 
 input group "=== BREAK-EVEN (R = initial risk) ==="
 input bool     UseBreakEven          = true;
@@ -371,7 +374,7 @@ int OnInit()
 
    RebuildLossPauses();
 
-   Print("=== DerivSMC_EA v1.27 Started ===");
+   Print("=== DerivSMC_EA v1.28 Started ===");
    Print("Symbols loaded: ", symbolCount,
          " | from file=", (SymbolsFromFile ? SymbolsFile : "SymbolsList"),
          " | Structure=", UseMarketStructure,
@@ -380,7 +383,8 @@ int OnInit()
          " | spike filter=", UseSpikeDirectionFilter,
          " | max daily loss $", MaxDailyLossMoney,
          " | RR ", RR_Ratio, " | structure TP=", UseStructureTP,
-         " (", MinTP_R, "-", MaxTP_R, "R) | partial=", UsePartialClose,
+         " (min ", MinTP_R, "R, cap ", (MaxTP_R > 0 ? DoubleToString(MaxTP_R, 1) + "R" : "none"),
+         ", HTF ", EnumToString(StructureTPHTF), ") | partial=", UsePartialClose,
          " @", PartialCloseAtR, "R ", PartialClosePercent, "%",
          " | alignment=", UseEntryAlignment, " (wait ", AlignWaitBars, " M1 bars)");
    for(int i=0; i<symbolCount; i++)
@@ -1113,41 +1117,107 @@ double LossAtSL(string sym, int signal, double lot, double entry, double sl)
    return MathMax(lossTv, lossCalc);
 }
 
-//------------------- TAKE-PROFIT TARGET (v1.27) ----------------------
-// TP distance from 'entry'. rD = 1R (entry-to-SL distance used for sizing the target).
-// If UseStructureTP: the nearest swing high (buy) / swing low (sell) on the SETUP
-// chart (EntryTF, closed bars) that is at least MinTP_R away, minus a small buffer,
-// capped at MaxTP_R. Otherwise / no valid swing: RR_Ratio x rD. Never < minDist.
+//------------------- TAKE-PROFIT TARGET (v1.28) ----------------------
+// Swing highs (highs=true) or lows on 'tf', closed bars. unbrokenOnly: keep a
+// swing only if no later bar (up to the last closed bar) traded beyond it, i.e.
+// liquidity still resting there (this includes equal highs / equal lows).
+void CollectStructureLevels(string sym, ENUM_TIMEFRAMES tf, bool highs, int lookback,
+                            bool unbrokenOnly, double &levels[])
+{
+   int strength = SwingStrength;
+   if(strength < 1) strength = 1;
+   if(lookback < strength * 2 + 1) lookback = strength * 2 + 1;
+   for(int shift = strength + 1; shift <= lookback; shift++)
+   {
+      double v = (highs ? iHigh(sym, tf, shift) : iLow(sym, tf, shift));
+      if(v <= 0) continue;
+      bool isSwing = true;
+      for(int k = 1; k <= strength; k++)
+      {
+         double a = (highs ? iHigh(sym, tf, shift + k) : iLow(sym, tf, shift + k));
+         double b = (highs ? iHigh(sym, tf, shift - k) : iLow(sym, tf, shift - k));
+         if(a <= 0 || b <= 0) { isSwing = false; break; }
+         if(highs  && (a >= v || b >= v)) { isSwing = false; break; }
+         if(!highs && (a <= v || b <= v)) { isSwing = false; break; }
+      }
+      if(!isSwing) continue;
+      if(unbrokenOnly && shift > 1)
+      {
+         int ext = (highs ? iHighest(sym, tf, MODE_HIGH, shift - 1, 1)
+                          : iLowest(sym, tf, MODE_LOW, shift - 1, 1));
+         if(ext < 0) continue;
+         double e = (highs ? iHigh(sym, tf, ext) : iLow(sym, tf, ext));
+         if(highs && e > v)  continue;     // taken out already
+         if(!highs && e < v) continue;
+      }
+      int n = ArraySize(levels);
+      ArrayResize(levels, n + 1);
+      levels[n] = v;
+   }
+}
+
+// Nearest structure level beyond 'from' (buy: above, sell: below) whose TP
+// (level minus buffer) is at least minD away. Search order:
+//   1) unbroken swings on the setup chart (EntryTF)
+//   2) unbroken swings on StructureTPHTF (H1)
+//   3) any swing on EntryTF, then 4) any swing on StructureTPHTF
+// Returns the TP distance from 'from' (0 = no level), src = where it came from.
+double FindStructureTarget(string sym, int signal, double from, double minD, double buf, string &src)
+{
+   src = "";
+   bool highs = (signal == 1);
+   for(int pass = 0; pass < 4; pass++)
+   {
+      bool unbroken = (pass < 2);
+      bool htf      = (pass == 1 || pass == 3);
+      ENUM_TIMEFRAMES tf = (htf ? StructureTPHTF : EntryTF);
+      int lb = (htf ? StructureTPHTFLookback : StructureTPLookback);
+      double levels[];
+      ArrayResize(levels, 0);
+      CollectStructureLevels(sym, tf, highs, lb, unbroken, levels);
+      double best = 0;
+      int n = ArraySize(levels);
+      for(int i = 0; i < n; i++)
+      {
+         double d = (signal == 1 ? (levels[i] - buf) - from : from - (levels[i] + buf));
+         if(d <= 0 || d < minD) continue;          // not beyond, or too close: look further out
+         if(best == 0 || d < best) best = d;       // nearest worthwhile level
+      }
+      if(best > 0)
+      {
+         src = (unbroken ? "unbroken swing " : "swing ") + EnumToString(tf);
+         return best;
+      }
+   }
+   return 0;
+}
+
+// TP distance from 'entry'. rD = 1R (entry-to-SL distance used for the target).
+// UseStructureTP: TP = the pair's next real structure level (FindStructureTarget)
+// that is at least MinTP_R away; no fixed multiple. Optional cap MaxTP_R (0 = none).
+// RR_Ratio x rD only when no structure level exists at all. Never < minDist.
 // The TP only decides where profit is taken; it never changes the SL or the lot.
 double TargetDistance(string sym, int signal, double entry, double rD, double atrE, double minDist)
 {
    if(rD <= 0) return minDist;
-   double rrD  = rD * RR_Ratio;
-   double tpD  = rrD;
-   string src  = "RR " + DoubleToString(RR_Ratio, 1);
+   double tpD  = rD * RR_Ratio;
+   string src  = "no structure level - RR " + DoubleToString(RR_Ratio, 1);
 
    if(UseStructureTP)
    {
       double buf = StructureTPBufferATR * atrE;
       if(buf < 0) buf = 0;
-      double minD = MinTP_R * rD;
-      double maxD = (MaxTP_R > 0 ? MaxTP_R * rD : 0);
-      double levels[];
-      ArrayResize(levels, 0);
-      CollectSwingLevels(sym, EntryTF, (signal == -1), StructureTPLookback, levels);  // highs for buys, lows for sells
-      double best = 0;
-      int n = ArraySize(levels);
-      for(int i = 0; i < n; i++)
+      string ssrc = "";
+      double d = FindStructureTarget(sym, signal, entry, MinTP_R * rD, buf, ssrc);
+      if(d > 0)
       {
-         double d = (signal == 1 ? (levels[i] - buf) - entry : entry - (levels[i] + buf));
-         if(d <= 0 || d < minD) continue;          // not beyond entry, or too close
-         if(best == 0 || d < best) best = d;       // nearest qualifying swing
-      }
-      if(best > 0)
-      {
-         tpD = best;
-         src = "swing " + EnumToString(EntryTF);
-         if(maxD > 0 && tpD > maxD) { tpD = maxD; src += " capped " + DoubleToString(MaxTP_R, 1) + "R"; }
+         tpD = d;
+         src = ssrc;
+         if(MaxTP_R > 0 && tpD > MaxTP_R * rD)
+         {
+            tpD = MaxTP_R * rD;
+            src += " capped " + DoubleToString(MaxTP_R, 1) + "R";
+         }
       }
    }
    if(signal == -1 && tpD >= entry) tpD = entry * 0.5;   // sell TP must stay above 0
@@ -1732,18 +1802,35 @@ void ManageOpenPositions()
          continue;
       }
 
-      // ---- v1.27: runner TP: after a real partial close, push TP out to MaxTP_R ----
-      if(RunnerRemoveTP && MaxTP_R > 0 && currentTP > 0 &&
+      // ---- runner TP (v1.27/v1.28): after a real partial close, move TP to the next structure level (or MaxTP_R cap) ----
+      if(RunnerRemoveTP && currentTP > 0 &&
          GlobalVariableCheck(PartialGVName(ticket)) && GlobalVariableGet(PartialGVName(ticket)) == 1 &&
          !GlobalVariableCheck(RunnerGVName(ticket)))
       {
-         double farTP = (type == POSITION_TYPE_BUY ? RoundToTick(sym, openPrice + MaxTP_R * rDist, 1)
-                                                   : RoundToTick(sym, openPrice - MaxTP_R * rDist, -1));
+         double farTP = 0;
+         string rsrc = "";
+         if(MaxTP_R > 0)
+         {
+            farTP = (type == POSITION_TYPE_BUY ? RoundToTick(sym, openPrice + MaxTP_R * rDist, 1)
+                                               : RoundToTick(sym, openPrice - MaxTP_R * rDist, -1));
+            rsrc = DoubleToString(MaxTP_R, 1) + "R cap";
+         }
+         else
+         {
+            // v1.28: next structure level beyond the current TP
+            int rsi = FindSymbolIndex(sym);
+            double ratr = (rsi >= 0 ? GetBufVal(symbols[rsi].atrHandle, 1) : 0);
+            double rbuf = (StructureTPBufferATR > 0 ? StructureTPBufferATR * ratr : 0);
+            int rsig = (type == POSITION_TYPE_BUY ? 1 : -1);
+            double rd = FindStructureTarget(sym, rsig, currentTP, minDist, rbuf, rsrc);
+            if(rd > 0)
+               farTP = (rsig == 1 ? RoundToTick(sym, currentTP + rd, 1) : RoundToTick(sym, currentTP - rd, -1));
+         }
          bool further = (type == POSITION_TYPE_BUY ? farTP > currentTP + ts * 0.5
                                                    : (farTP < currentTP - ts * 0.5 && farTP > 0));
          bool tpFrozen = (freezeD > 0 && MathAbs((type == POSITION_TYPE_BUY ? bid : ask) - currentTP) <= freezeD);
          if(!further)
-            GlobalVariableSet(RunnerGVName(ticket), 1);   // TP already at/after MaxTP_R
+            GlobalVariableSet(RunnerGVName(ticket), 1);   // no level beyond the TP / TP already there
          else if(!tpFrozen)
          {
             bool tok = trade.PositionModify(ticket, currentSL, farTP);
@@ -1753,7 +1840,7 @@ void ManageOpenPositions()
                GlobalVariableSet(RunnerGVName(ticket), 1);
                modStates[ms].fails = 0;
                modStates[ms].nextAllowed = now + ModifyMinSeconds;
-               Print(sym, " #", ticket, " runner TP moved to ", farTP, " (", DoubleToString(MaxTP_R, 1), "R)");
+               Print(sym, " #", ticket, " runner TP moved to ", farTP, " (", rsrc, ")");
             }
             else
             {

@@ -1,12 +1,25 @@
-# Deriv-SMC-EA v1.27
+# Deriv-SMC-EA v1.28
 
 **Multi-Pair MT5 Expert Advisor**  
 Strategies: **CRT → Rejection Block → Order Block**  
 with an H1 trend filter, setup-timeframe market structure, and 1-minute market-entry timing.
 
+### New in v1.28
+- **TP follows the pair's structure, with no fixed R multiple.** The bot targets the next level price can realistically reach:
+  1. the nearest **unbroken** swing high (buys) or swing low (sells) on the setup chart (`EntryTF`, M5), meaning a level no later candle has traded through yet, so liquidity still rests there (equal highs and lows count)
+  2. if there is none, the same on `StructureTPHTF` (H1)
+  3. then any swing on M5, then any swing on H1
+  4. only if no structure level exists at all: `RR_Ratio` (3R)
+
+  Levels closer than `MinTP_R` (2.5R) are skipped, and the bot looks further out. TP sits `StructureTPBufferATR` × ATR before the level so it fills.
+- `MaxTP_R` now defaults to **0 = no cap, TP goes to structure**. It is kept only as an optional safety cap.
+- Deep-limit TP uses the same structure target (at least where a market entry's TP would be).
+- `RunnerRemoveTP` (off by default): after a real partial close, it moves the TP to the **next structure level beyond** the current TP, or to `MaxTP_R` if a cap is set.
+- SL, lot size, and $ risk logic are unchanged.
+
 ### New in v1.27
 - **Bigger targets**: `RR_Ratio` is now 3.0 (was 2.0).
-- **Structure TP from the setup chart** (`UseStructureTP`): TP goes to the nearest swing high (buys) or swing low (sells) on the same chart the setup came from (`EntryTF`, M5), looking back `StructureTPLookback` (100) bars. The swing is only used if it is at least `MinTP_R` (2.5R) away. TP is set `StructureTPBufferATR` (0.1) × ATR before the swing so it fills, and it is capped at `MaxTP_R` (6R). If there is no such swing, TP = `RR_Ratio` × SL distance. The TP never changes the SL or the lot size, so the $ risk is the same.
+- **Structure TP from the setup chart** (`UseStructureTP`): TP goes to the nearest swing high (buys) or swing low (sells) on the same chart the setup came from (`EntryTF`, M5), looking back `StructureTPLookback` (100) bars. The swing is only used if it is at least `MinTP_R` (2.5R) away. TP is set `StructureTPBufferATR` (0.1) × ATR before the swing so it fills, and it can be capped by `MaxTP_R` (see v1.28). If there is no such swing, TP = `RR_Ratio` × SL distance. The TP never changes the SL or the lot size, so the $ risk is the same.
 - **Deep limit TP**: the TP is placed where a market entry's TP would have been (or further). That is at least `RR_Ratio` × the normal 1.5 ATR SL distance from the limit price, so a tight-stop limit gets a big R.
 - **Let winners run**:
   - Break-even moves at `BreakEvenAtR` 1.5R (was 1.0) and locks `BreakEvenLockR` 0.3R (was 0.1).
@@ -14,7 +27,7 @@ with an H1 trend filter, setup-timeframe market structure, and 1-minute market-e
 - **Partial close** (`UsePartialClose`): at `PartialCloseAtR` (2R) it closes `PartialClosePercent` (50%) and the rest keeps running.
   - It is skipped safely if the lot can't be split into min-lot steps (for example, a min-lot trade), or if the account is netting.
   - It runs once per trade and is remembered across restarts.
-- **Runner TP** (`RunnerRemoveTP`, off by default): after a real partial close, the TP is moved out to `MaxTP_R` from entry.
+- **Runner TP** (`RunnerRemoveTP`, off by default): after a real partial close, the TP is moved further out (see v1.28).
 - **Entry alignment** (`UseEntryAlignment`): this check runs right before ANY order (market or deep limit). For a BUY:
   - the last closed M1 bar is bullish and closes above the prior M1 high
   - M1 EMA `AlignFastEMA` (9) is above EMA `AlignSlowEMA` (21)
