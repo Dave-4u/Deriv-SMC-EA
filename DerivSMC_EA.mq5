@@ -64,7 +64,9 @@ input double   BreakEvenProfit       = 0.2;        // Lock this profit ($)
 input group "=== BROKER STOP LEVELS (v1.25) ==="
 input double   StopsSpreadBuffer     = 1.0;        // Spreads added to the broker min stop distance
 input int      ExtraStopBufferPoints = 0;          // Extra points added to the min stop distance
-input int      InvalidStopsCooldownMin = 30;       // Pause a symbol this long after an [invalid stops] entry
+input int      InvalidStopsCooldownMin = 30;
+input bool     UseDeepLimitFallback  = true;       // If min lot risks > $ at market, place a limit nearer the SL
+input int      LimitExpireMinutes    = 60;         // Deep limit lifetime (broker expiry or manual cancel)       // Pause a symbol this long after an [invalid stops] entry
 input int      ModifyMinSeconds      = 3;          // Min seconds between SL modify attempts per ticket
 input int      ModifyMaxBackoffSec   = 300;        // Max wait after repeated modify rejections
 input double   TrailMinImproveMoney  = 0.10;       // Only move SL if it locks at least this much more ($)
@@ -88,6 +90,9 @@ struct SymbolData
    int      pendingAgeM1;
    datetime blockedUntil;   // v1.25: cooldown after [invalid stops] on entry
    int      stopsFails;     // v1.25: consecutive [invalid stops] entry rejections
+   int      pendingType;    // v1.25: 1 = CRT, 2 = Rejection Block, 3 = Order Block
+   double   zoneLo;         // v1.25: setup zone used by the deep limit fallback
+   double   zoneHi;
 };
 
 // v1.25: per-ticket SL modify throttle
@@ -233,6 +238,9 @@ int OnInit()
       symbols[symbolCount].pendingAgeM1 = 0;
       symbols[symbolCount].blockedUntil = 0;
       symbols[symbolCount].stopsFails = 0;
+      symbols[symbolCount].pendingType = 0;
+      symbols[symbolCount].zoneLo = 0;
+      symbols[symbolCount].zoneHi = 0;
 
       for(int c = 0; c < customCount; c++)
       {
@@ -307,6 +315,7 @@ void OnDeinit(const int reason)
 void OnTick()
 {
    ManageOpenPositions();
+   ManagePendingOrders();
 
    if(!CheckDailyLossLimit()) return;
    if(UseNewsFilter && IsNewsTime()) return;
@@ -362,9 +371,22 @@ void OnTick()
       }
 
       int signal = 0;
-      if(EnableCRT)            signal = DetectCRT(sym, trend);
-      if(signal == 0 && EnableRejectionBlock) signal = DetectRejectionBlock(sym, trend);
-      if(signal == 0 && EnableOrderBlock)     signal = DetectOrderBlock(sym, trend);
+      int setupType = 0;
+      if(EnableCRT)
+      {
+         signal = DetectCRT(sym, trend);
+         if(signal != 0) setupType = 1;
+      }
+      if(signal == 0 && EnableRejectionBlock)
+      {
+         signal = DetectRejectionBlock(sym, trend);
+         if(signal != 0) setupType = 2;
+      }
+      if(signal == 0 && EnableOrderBlock)
+      {
+         signal = DetectOrderBlock(sym, trend);
+         if(signal != 0) setupType = 3;
+      }
 
       if(signal == 0)
       {
@@ -378,6 +400,12 @@ void OnTick()
          ClearPending(i);
          continue;
       }
+
+      symbols[i].pendingType = setupType;
+      double zLo = 0, zHi = 0;
+      GetSetupZone(sym, setupType, zLo, zHi);
+      symbols[i].zoneLo = zLo;
+      symbols[i].zoneHi = zHi;
 
       if(!UseM1EntryTiming)
       {
@@ -722,22 +750,22 @@ bool OpenTrade(int idx, int signal)
    {
       price = ask;
       sl = RoundToTick(sym, price - slDistance, -1);        // round away from price
-      double slD = price - sl;
-      double tpD = MathMax(slD * RR_Ratio, minDist);
-      tp = RoundToTick(sym, price + tpD, 1);
-      // Correct side checks (buy SL/TP are triggered by bid)
+      // Correct side (buy SL/TP are triggered by bid)
       if(sl > bid - minDist) sl = RoundToTick(sym, bid - minDist, -1);
+      double slD = price - sl;
+      double tpD = MathMax(slD * RR_Ratio, minDist);           // TP keeps the RR of the final SL
+      tp = RoundToTick(sym, price + tpD, 1);
       if(sl >= bid || tp <= ask) { Print(sym, " BUY skipped: stops on wrong side"); return false; }
    }
    else
    {
       price = bid;
       sl = RoundToTick(sym, price + slDistance, 1);
+      // Correct side (sell SL/TP are triggered by ask)
+      if(sl < ask + minDist) sl = RoundToTick(sym, ask + minDist, 1);
       double slD = sl - price;
       double tpD = MathMax(slD * RR_Ratio, minDist);
       tp = RoundToTick(sym, price - tpD, -1);
-      // Sell SL/TP are triggered by ask
-      if(sl < ask + minDist) sl = RoundToTick(sym, ask + minDist, 1);
       if(sl <= ask || tp >= bid || tp <= 0) { Print(sym, " SELL skipped: stops on wrong side"); return false; }
    }
 
@@ -752,10 +780,7 @@ bool OpenTrade(int idx, int signal)
    double minLot = SymbolInfoDouble(sym, SYMBOL_VOLUME_MIN);
    double step   = SymbolInfoDouble(sym, SYMBOL_VOLUME_STEP);
    if(lot <= 0 || lot < minLot)
-   {
-      Print(sym, " skipped: min lot would risk more than $", risk);
-      return false;
-   }
+      return TryDeepLimit(idx, signal, sl, bid, ask, minDist);
 
    double loss = LossAtSL(sym, signal, lot, price, sl);
    int guard = 0;
@@ -766,6 +791,8 @@ bool OpenTrade(int idx, int signal)
       loss = LossAtSL(sym, signal, lot, price, sl);
       guard++;
    }
+   if(loss >= 0 && (lot <= 0 || lot < minLot))
+      return TryDeepLimit(idx, signal, sl, bid, ask, minDist);
    if(lot <= 0 || lot < minLot || loss < 0 || loss > risk)
    {
       Print(sym, " skipped: cannot keep loss at SL <= $", risk, " (loss=", DoubleToString(loss, 2), ")");
@@ -798,6 +825,178 @@ bool OpenTrade(int idx, int signal)
    else
       Print(sym, " entry failed: ", rc, " ", trade.ResultRetcodeDescription());
    return false;
+}
+
+//------------------- DEEP LIMIT FALLBACK (v1.25) --------------------
+// Setup zone of the bars the detector used (EntryTF, closed bars)
+void GetSetupZone(string sym, int setupType, double &lo, double &hi)
+{
+   int bars = 1;                       // 2 = Rejection Block: setup candle only
+   if(setupType == 1) bars = 2;        // CRT: range candle + sweep candle
+   if(setupType == 3) bars = 3;        // Order Block: 3-bar swing
+   lo = 0; hi = 0;
+   for(int b = 1; b <= bars; b++)
+   {
+      double h = iHigh(sym, EntryTF, b);
+      double l = iLow(sym, EntryTF, b);
+      if(h <= 0 || l <= 0) continue;
+      if(hi == 0 || h > hi) hi = h;
+      if(lo == 0 || l < lo) lo = l;
+   }
+}
+
+// Min lot is too big for RiskMoney at market: place a limit closer to the same SL
+// so that min lot loses <= RiskMoney at SL. Only inside the setup zone.
+bool TryDeepLimit(int idx, int signal, double sl, double bid, double ask, double minDist)
+{
+   string sym  = symbols[idx].name;
+   double risk = symbols[idx].risk;
+   double zLo  = symbols[idx].zoneLo;
+   double zHi  = symbols[idx].zoneHi;
+   string side = (signal == 1 ? "BUY LIMIT" : "SELL LIMIT");
+
+   if(!UseDeepLimitFallback)
+   {
+      Print(sym, " skipped: min lot would risk more than $", risk);
+      return false;
+   }
+   if(zLo <= 0 || zHi <= 0 || zHi <= zLo)
+   {
+      Print(sym, " deep limit fallback: no setup zone - skipped");
+      return false;
+   }
+
+   double minLot  = SymbolInfoDouble(sym, SYMBOL_VOLUME_MIN);
+   double lot     = NormalizeLot(sym, minLot);
+   double perUnit = LossPerPriceUnit(sym);
+   double point   = SymbolInfoDouble(sym, SYMBOL_POINT);
+   double ts      = SymTickSize(sym);
+   if(lot <= 0 || perUnit <= 0 || ts <= 0) return false;
+
+   // Largest entry-to-SL distance min lot may have (minus slippage allowance)
+   double allowDist = risk / (lot * perUnit) - (double)Slippage * point;
+   if(allowDist < minDist)
+   {
+      Print(sym, " deep limit fallback: allowed SL distance ", DoubleToString(allowDist, 8),
+            " is inside broker min ", DoubleToString(minDist, 8), " - skipped");
+      return false;
+   }
+
+   double lp;
+   if(signal == 1) lp = RoundToTick(sym, sl + allowDist, -1);   // round toward SL = less risk
+   else            lp = RoundToTick(sym, sl - allowDist, 1);
+
+   // Re-verify actual loss; step toward the SL (never past min distance) if needed
+   double loss = LossAtSL(sym, signal, lot, lp, sl);
+   int guard = 0;
+   while(loss > risk && guard < 1000)
+   {
+      lp = (signal == 1 ? lp - ts : lp + ts);
+      lp = RoundToTick(sym, lp, 0);
+      loss = LossAtSL(sym, signal, lot, lp, sl);
+      guard++;
+   }
+   if(loss < 0 || loss > risk || MathAbs(lp - sl) < minDist)
+   {
+      Print(sym, " deep limit fallback: cannot keep loss <= $", risk, " - skipped");
+      return false;
+   }
+
+   // Limit price must be in the setup zone and far enough from the market
+   if(lp < zLo || lp > zHi)
+   {
+      Print(sym, " deep limit fallback: ", side, " ", lp, " outside setup zone [",
+            zLo, " - ", zHi, "] - skipped");
+      return false;
+   }
+   if(signal == 1 && lp > ask - minDist)
+   {
+      Print(sym, " deep limit fallback: ", side, " ", lp, " too close to ask ", ask, " - skipped");
+      return false;
+   }
+   if(signal == -1 && lp < bid + minDist)
+   {
+      Print(sym, " deep limit fallback: ", side, " ", lp, " too close to bid ", bid, " - skipped");
+      return false;
+   }
+
+   // Same SL; TP re-based from the limit price to keep RR
+   double slD = MathAbs(lp - sl);
+   double tpD = MathMax(slD * RR_Ratio, minDist);
+   double tp  = (signal == 1 ? RoundToTick(sym, lp + tpD, 1) : RoundToTick(sym, lp - tpD, -1));
+   if(tp <= 0) return false;
+
+   // Expiry: broker-side if supported, otherwise GTC + manual cancel in ManagePendingOrders
+   ENUM_ORDER_TYPE_TIME tt = ORDER_TIME_GTC;
+   datetime expiry = 0;
+   int expMode = (int)SymbolInfoInteger(sym, SYMBOL_EXPIRATION_MODE);
+   if(LimitExpireMinutes > 0 && (expMode & SYMBOL_EXPIRATION_SPECIFIED) == SYMBOL_EXPIRATION_SPECIFIED)
+   {
+      tt  = ORDER_TIME_SPECIFIED;
+      expiry = TimeCurrent() + LimitExpireMinutes * 60;
+   }
+
+   trade.SetTypeFilling(ORDER_FILLING_RETURN);   // pending orders
+   bool ok;
+   if(signal == 1) ok = trade.BuyLimit(lot, lp, sym, sl, tp, tt, expiry, "SMC DeepLimit");
+   else            ok = trade.SellLimit(lot, lp, sym, sl, tp, tt, expiry, "SMC DeepLimit");
+   uint rc = trade.ResultRetcode();
+   SetFillingForSymbol(sym);
+
+   if(ok && (rc == TRADE_RETCODE_DONE || rc == TRADE_RETCODE_PLACED))
+   {
+      Print(sym, " deep limit fallback: ", side, " ", lp, " lot ", lot, " sl ", sl, " tp ", tp,
+            " max loss $", DoubleToString(loss, 2),
+            (tt == ORDER_TIME_SPECIFIED ? " (broker expiry)" : " (manual expiry)"));
+      symbols[idx].stopsFails = 0;
+      return true;
+   }
+   if(rc == TRADE_RETCODE_INVALID_STOPS || rc == TRADE_RETCODE_INVALID_PRICE)
+   {
+      symbols[idx].stopsFails++;
+      symbols[idx].blockedUntil = TimeCurrent() + InvalidStopsCooldownMin * 60;
+   }
+   Print(sym, " deep limit fallback: ", side, " failed ", rc, " ", trade.ResultRetcodeDescription());
+   return false;
+}
+
+// Cancel our pending limits when they are too old or the H1 trend flips
+void ManagePendingOrders()
+{
+   static datetime lastRun = 0;
+   datetime now = TimeCurrent();
+   if(now == lastRun) return;    // at most once per second
+   lastRun = now;
+
+   for(int i = OrdersTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = OrderGetTicket(i);
+      if(ticket == 0 || !OrderSelect(ticket)) continue;
+      if(OrderGetInteger(ORDER_MAGIC) != MagicNumber) continue;
+      long otype = OrderGetInteger(ORDER_TYPE);
+      if(otype != ORDER_TYPE_BUY_LIMIT && otype != ORDER_TYPE_SELL_LIMIT) continue;
+
+      string sym = OrderGetString(ORDER_SYMBOL);
+      datetime setup = (datetime)OrderGetInteger(ORDER_TIME_SETUP);
+      int dir = (otype == ORDER_TYPE_BUY_LIMIT ? 1 : -1);
+
+      string why = "";
+      if(LimitExpireMinutes > 0 && now - setup >= LimitExpireMinutes * 60)
+         why = "expired";
+      else
+      {
+         for(int s = 0; s < symbolCount; s++)
+         {
+            if(symbols[s].name != sym) continue;
+            int trend = GetTrendDirection(s);
+            if(trend == -dir) why = "trend flipped";
+            break;
+         }
+      }
+      if(why == "") continue;
+      if(trade.OrderDelete(ticket))
+         Print(sym, " deep limit fallback: order #", ticket, " deleted (", why, ")");
+   }
 }
 
 //------------------- MODIFY THROTTLE (v1.25) -------------------------
@@ -992,6 +1191,14 @@ int CountPositionsOnSymbol(string sym)
       if(PositionGetString(POSITION_SYMBOL) == sym && PositionGetInteger(POSITION_MAGIC) == MagicNumber)
          count++;
    }
+   // v1.25: our pending (deep limit) orders count too -> one per symbol
+   for(int j = OrdersTotal()-1; j >= 0; j--)
+   {
+      ulong ot = OrderGetTicket(j);
+      if(ot == 0 || !OrderSelect(ot)) continue;
+      if(OrderGetString(ORDER_SYMBOL) == sym && OrderGetInteger(ORDER_MAGIC) == MagicNumber)
+         count++;
+   }
    return count;
 }
 
@@ -1003,6 +1210,14 @@ int CountAllOpenPositions()
       ulong ticket = PositionGetTicket(i);
       if(ticket == 0 || !PositionSelectByTicket(ticket)) continue;
       if(PositionGetInteger(POSITION_MAGIC) == MagicNumber)
+         count++;
+   }
+   // v1.25: pending orders count toward MaxOpenTrades
+   for(int j = OrdersTotal()-1; j >= 0; j--)
+   {
+      ulong ot = OrderGetTicket(j);
+      if(ot == 0 || !OrderSelect(ot)) continue;
+      if(OrderGetInteger(ORDER_MAGIC) == MagicNumber)
          count++;
    }
    return count;
