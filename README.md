@@ -1,10 +1,30 @@
-# Deriv-SMC-EA v1.25
+# Deriv-SMC-EA v1.26
 
 **Multi-Pair MT5 Expert Advisor**  
 Strategies: **CRT → Rejection Block → Order Block**  
 with an H1 trend filter, setup-timeframe market structure, and 1-minute market-entry timing.
 
-### New in v1.25
+### New in v1.26
+- **Spike-direction filter** (`UseSpikeDirectionFilter`): no SELLs on Boom or DEX … UP, and no BUYs on Crash or DEX … DOWN. These are the trades that got run through their SL by spikes.
+- **Smaller risk on spike symbols**: Boom, Crash, DEX and Jump use `SpikeRiskMoney` ($2). Other symbols keep `RiskMoney` ($3), and `CustomRiskList` still overrides both.
+- **R-based exits**: R is the trade's initial risk (entry to the first SL).
+  - Break-even moves when profit reaches `BreakEvenAtR` (1R) and locks `BreakEvenLockR` (0.1R) plus the spread.
+  - Trailing starts at `TrailStartR` (1.5R) and trails `TrailATRMult` × ATR(EntryTF), so winners can run.
+  - R is saved per ticket in a terminal global variable. If that is missing (for example after a restart on another terminal), it is read back from the opening order's SL in history.
+  - The v1.25 modify safety still applies: minimum distance, throttle, and no resending a refused SL.
+- **Deep limit at levels**: when even the min lot risks too much at market, the bot looks for a limit price in three places:
+  - the setup candles
+  - recent swing support (for buys) or resistance (for sells) on EntryTF, ConfirmTF (M15) and TrendTF (H1)
+  - anywhere within `DeepLevelTolATR` × ATR of one of those levels
+
+  The limit is moved back from the market to the broker's minimum distance instead of being rejected as "too close". Expiry and cancelling on a trend flip work as before.
+- **Daily $ stop**: once the EA's closed P/L today (by server day, for this magic number) reaches -`MaxDailyLossMoney` ($9), it takes no new entries and cancels its pending limits until the next server day.
+- **Per-symbol pause**: after `ConsecLossPause` (2) losses in a row on one symbol, that symbol is skipped for `SymbolPauseHours` (3). Losing streaks are rebuilt from history when the EA restarts.
+- **M15 trend check**: the M15 EMA trend (`ConfirmTF`) must agree with H1 (`UseConfirmTFTrend`).
+- `MaxOpenTrades` now defaults to 3, and pending limits count toward it.
+- **No chasing**: skip if the last closed M1 or M5 bar is bigger than `BigCandleATRMult` (2) × ATR(14). Also skip if price is more than `MaxChaseATR` (0.5) × ATR beyond the setup zone in the trade direction.
+
+### From v1.25
 - Entries respect the broker's stop and freeze levels plus a spread buffer, with SL/TP rounded to tick size and placed on the correct side of bid/ask. If the SL has to be widened, the lot is recalculated so the trade still risks no more than `RiskMoney`. TP moves out to keep the same RR.
 - Strict $ risk: the lot is based on the final SL measured from the real entry price (ask or bid, so spread is included) plus `Slippage`. It uses the larger of `TICK_VALUE_LOSS` and `TICK_VALUE`, rounds down to the volume step, and re-checks the loss at SL with `OrderCalcProfit`. If the loss is still above `RiskMoney`, the lot is reduced, and the trade is skipped if min lot still risks too much.
 - Deep limit fallback (`UseDeepLimitFallback`, default on): when even the min lot would risk more than `RiskMoney` at market, the bot places a Buy/Sell Limit closer to the same SL, so that the min lot loses no more than `RiskMoney` at SL. TP is re-based to keep the RR. The order is placed only if the limit price is inside the setup zone (the CRT, rejection, or OB candles) and respects stop levels. It expires after `LimitExpireMinutes` (default 60), at the broker if the symbol supports expiry and otherwise cancelled by the bot, and it is deleted if the H1 trend flips. Pending orders count toward `MaxOpenTrades` and the one-per-symbol rule. Look for `deep limit fallback` lines in the log.
@@ -70,16 +90,43 @@ SetupExpireM1Bars    = 15           // Drop the setup if no M1 confirm in time
 
 Set `UseM1EntryTiming` to false to enter at market as soon as the setup appears.
 
-### Trailing & Break-even
+### Break-even & Trailing (v1.26, R = initial risk)
 ```
-UseTrailingStop      = true
-TrailingStart        = 1.0          // Start trailing after $1 profit
-TrailingStep         = 0.5          // Trail by $0.5
-
 UseBreakEven         = true
-BreakEvenTrigger     = 1.5          // Move SL to BE after $1.5 profit
-BreakEvenProfit      = 0.2          // Lock $0.2 profit
+BreakEvenAtR         = 1.0          // Move SL to BE at +1R
+BreakEvenLockR       = 0.1          // Lock 0.1R + spread
+
+UseTrailingStop      = true
+TrailStartR          = 1.5          // Start trailing at +1.5R
+TrailATRMult         = 1.5          // Trail 1.5 x ATR(EntryTF) behind price
 ```
+
+### Risk, protection & filters (v1.26)
+```
+SpikeRiskMoney          = 2.0       // Risk for Boom/Crash/DEX/Jump
+MaxOpenTrades           = 3         // Positions + pending limits
+MaxDailyLossMoney       = 9.0       // Stop new entries after -$9 closed today (0 = off)
+ConsecLossPause         = 2         // Losses in a row before pausing a symbol (0 = off)
+SymbolPauseHours        = 3
+UseSpikeDirectionFilter = true
+ConfirmTF               = M15
+UseConfirmTFTrend       = true
+UseBigCandleFilter      = true
+BigCandleATRMult        = 2.0
+MaxChaseATR             = 0.5       // 0 = off
+DeepLimitLookback       = 50        // Bars to search for swing levels
+DeepLevelTolATR         = 0.2       // Limit may sit within 0.2 ATR of a level
+DeepLimitRequireLevel   = true      // false = any price within the $ cap
+```
+
+### Recommended symbols (for now)
+Live results suggest leaving out the **Step Indices**, **Range Break 200** and **DEX 900 UP** for now: their min lot is too big for a $3 stop, or they keep spiking against entries. To do that, delete or `#`-comment those lines in `DaveSymbols.txt`, for example:
+```
+# Step Index 200
+# Range Break 200 Index
+# DEX 900 UP Index
+```
+Edit the file yourself in `MQL5\Files`. The EA never changes it.
 
 ### Broker stop levels (v1.25)
 ```

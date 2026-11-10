@@ -2,11 +2,11 @@
 //|                                                  DerivSMC_EA.mq5 |
 //|  Multi-Pair | CRT + Rejection + OrderBlock | Trailing + BE       |
 //|  Works on Synthetics + Gold + Forex | Fixed $ Risk               |
-//|  v1.25: broker stop levels respected; trailing modify throttle  |
+//|  v1.26: spike filter, R-based exits, daily/symbol loss stops    |
 //+------------------------------------------------------------------+
 #property copyright "Dave-4u"
 #property link      "https://github.com/Dave-4u/Deriv-SMC-EA"
-#property version   "1.25"
+#property version   "1.26"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -18,13 +18,18 @@ input string   SymbolsList           = "Volatility 75 Index,Volatility 100 Index
 input bool     SymbolsFromFile       = true;       // Read names from a .txt in MQL5\\Files
 input string   SymbolsFile           = "DaveSymbols.txt"; // one name per line or comma-separated, # = comment
 input double   RiskMoney             = 3.0;        // Default risk in $
-input int      MaxOpenTrades         = 10;
+input double   SpikeRiskMoney        = 2.0;        // Risk in $ for Boom/Crash/DEX/Jump (CustomRiskList still overrides)
+input int      MaxOpenTrades         = 3;          // Positions + pending limits
 input string   CustomRiskList        = "";         // Optional: Symbol:Risk,Symbol:Risk (e.g. XAUUSD:5,Volatility 75 Index:2.5)
 
 input group "=== PROTECTION ==="
 input double   DailyLossLimitPercent = 3.0;
 input int      MagicNumber           = 20261109;
 input int      MaxSpreadPoints       = 150;
+input double   MaxDailyLossMoney     = 9.0;        // Stop new entries after this closed loss today ($, server day; 0 = off)
+input int      ConsecLossPause       = 2;          // Losses in a row on one symbol before pausing it (0 = off)
+input int      SymbolPauseHours      = 3;          // Pause length for that symbol
+input bool     UseSpikeDirectionFilter = true;     // No SELL on Boom / DEX..UP, no BUY on Crash / DEX..DOWN
 
 input group "=== STRATEGY SWITCHES ==="
 input bool     EnableCRT             = true;
@@ -35,6 +40,7 @@ input group "=== TIMEFRAMES ==="
 input ENUM_TIMEFRAMES TrendTF        = PERIOD_H1;
 input ENUM_TIMEFRAMES EntryTF        = PERIOD_M5;  // Setup timeframe (strategies + structure)
 input ENUM_TIMEFRAMES ExecTF         = PERIOD_M1;  // Timing chart for market entry
+input ENUM_TIMEFRAMES ConfirmTF      = PERIOD_M15; // Middle trend timeframe (must agree with TrendTF)
 
 input group "=== TREND & STRUCTURE ==="
 input int      EMA_Period            = 50;
@@ -42,6 +48,12 @@ input int      CooldownBars          = 12;
 input bool     UseMarketStructure    = true;       // Require setup-TF structure to agree with trend
 input int      StructureLookback     = 50;         // Bars on EntryTF to read swings
 input int      SwingStrength         = 2;          // Pivot bars on each side
+input bool     UseConfirmTFTrend     = true;       // Require ConfirmTF EMA trend to agree with TrendTF
+
+input group "=== ENTRY FILTERS (v1.26) ==="
+input bool     UseBigCandleFilter    = true;       // Skip after an oversized candle
+input double   BigCandleATRMult      = 2.0;        // Last closed M1/M5 bar range > this x ATR(14) = skip
+input double   MaxChaseATR           = 0.5;        // Skip if price is this x ATR beyond the setup zone (0 = off)
 
 input group "=== M1 ENTRY TIMING ==="
 input bool     UseM1EntryTiming      = true;       // If false, enter at market when the setup appears
@@ -51,15 +63,15 @@ input group "=== TRADE MANAGEMENT ==="
 input double   RR_Ratio              = 2.0;
 input int      Slippage              = 30;
 
-input group "=== TRAILING STOP ==="
-input bool     UseTrailingStop       = true;
-input double   TrailingStart         = 1.0;        // Start trailing after this profit ($)
-input double   TrailingStep          = 0.5;        // Trail distance ($)
-
-input group "=== BREAK-EVEN ==="
+input group "=== BREAK-EVEN (R = initial risk) ==="
 input bool     UseBreakEven          = true;
-input double   BreakEvenTrigger      = 1.5;        // Move to BE after this profit ($)
-input double   BreakEvenProfit       = 0.2;        // Lock this profit ($)
+input double   BreakEvenAtR          = 1.0;        // Move SL to BE when profit >= this x R
+input double   BreakEvenLockR        = 0.1;        // Lock this x R (+ spread) beyond entry
+
+input group "=== TRAILING STOP (R / ATR) ==="
+input bool     UseTrailingStop       = true;
+input double   TrailStartR           = 1.5;        // Start trailing when profit >= this x R
+input double   TrailATRMult          = 1.5;        // Trail distance = this x ATR(EntryTF)
 
 input group "=== BROKER STOP LEVELS (v1.25) ==="
 input double   StopsSpreadBuffer     = 1.0;        // Spreads added to the broker min stop distance
@@ -67,6 +79,9 @@ input int      ExtraStopBufferPoints = 0;          // Extra points added to the 
 input int      InvalidStopsCooldownMin = 30;      // Pause a symbol this long after an [invalid stops] entry
 input bool     UseDeepLimitFallback  = true;       // If min lot risks > $ at market, place a limit nearer the SL
 input int      LimitExpireMinutes    = 60;         // Deep limit lifetime (broker expiry or manual cancel)
+input int      DeepLimitLookback     = 50;         // Bars on EntryTF/ConfirmTF/TrendTF to find swing levels
+input double   DeepLevelTolATR       = 0.2;        // Limit may sit within this x ATR of a swing level
+input bool     DeepLimitRequireLevel = true;       // Limit only at the setup zone or a swing level
 input int      ModifyMinSeconds      = 3;          // Min seconds between SL modify attempts per ticket
 input int      ModifyMaxBackoffSec   = 300;        // Max wait after repeated modify rejections
 input double   TrailMinImproveMoney  = 0.10;       // Only move SL if it locks at least this much more ($)
@@ -86,6 +101,10 @@ struct SymbolData
    int      cooldown;
    int      atrHandle;
    int      emaHandle;
+   int      atrExecHandle;  // v1.26: ATR(14) on ExecTF for the big-candle filter
+   int      emaConfHandle;  // v1.26: EMA on ConfirmTF
+   int      consecLosses;   // v1.26: losses in a row
+   datetime pausedUntil;    // v1.26: per-symbol loss pause
    int      pendingSignal;
    int      pendingAgeM1;
    datetime blockedUntil;   // v1.25: cooldown after [invalid stops] on entry
@@ -102,8 +121,13 @@ struct ModifyState
    datetime nextAllowed;
    double   lastRejectedSL;
    int      fails;
+   double   riskDist;       // v1.26: initial entry-to-SL distance (0 = not read yet, -1 = unknown)
 };
 ModifyState modStates[];
+bool       dailyStopActive = false;
+bool       plDirty = true;
+double     todayClosedPL = 0;
+datetime   lastPLCalc = 0;
 
 SymbolData symbols[];
 int        symbolCount = 0;
@@ -228,12 +252,16 @@ int OnInit()
       }
 
       symbols[symbolCount].name = baseSymbols[i];
-      symbols[symbolCount].risk = RiskMoney;
+      symbols[symbolCount].risk = (IsSpikeSymbol(baseSymbols[i]) ? SpikeRiskMoney : RiskMoney);
       symbols[symbolCount].lastBar = 0;
       symbols[symbolCount].lastExecBar = 0;
       symbols[symbolCount].cooldown = 0;
       symbols[symbolCount].atrHandle = INVALID_HANDLE;
       symbols[symbolCount].emaHandle = INVALID_HANDLE;
+      symbols[symbolCount].atrExecHandle = INVALID_HANDLE;
+      symbols[symbolCount].emaConfHandle = INVALID_HANDLE;
+      symbols[symbolCount].consecLosses = 0;
+      symbols[symbolCount].pausedUntil = 0;
       symbols[symbolCount].pendingSignal = 0;
       symbols[symbolCount].pendingAgeM1 = 0;
       symbols[symbolCount].blockedUntil = 0;
@@ -261,17 +289,24 @@ int OnInit()
 
       int atrHandle = iATR(baseSymbols[i], EntryTF, 14);
       int emaHandle = iMA(baseSymbols[i], TrendTF, EMA_Period, 0, MODE_EMA, PRICE_CLOSE);
+      int atrXHandle = iATR(baseSymbols[i], ExecTF, 14);
+      int emaCHandle = iMA(baseSymbols[i], ConfirmTF, EMA_Period, 0, MODE_EMA, PRICE_CLOSE);
 
-      if(atrHandle == INVALID_HANDLE || emaHandle == INVALID_HANDLE)
+      if(atrHandle == INVALID_HANDLE || emaHandle == INVALID_HANDLE ||
+         atrXHandle == INVALID_HANDLE || emaCHandle == INVALID_HANDLE)
       {
          Print("Failed to create handles for ", baseSymbols[i]);
-         if(atrHandle != INVALID_HANDLE) IndicatorRelease(atrHandle);
-         if(emaHandle != INVALID_HANDLE) IndicatorRelease(emaHandle);
+         if(atrHandle  != INVALID_HANDLE) IndicatorRelease(atrHandle);
+         if(emaHandle  != INVALID_HANDLE) IndicatorRelease(emaHandle);
+         if(atrXHandle != INVALID_HANDLE) IndicatorRelease(atrXHandle);
+         if(emaCHandle != INVALID_HANDLE) IndicatorRelease(emaCHandle);
          continue;
       }
 
       symbols[symbolCount].atrHandle = atrHandle;
       symbols[symbolCount].emaHandle = emaHandle;
+      symbols[symbolCount].atrExecHandle = atrXHandle;
+      symbols[symbolCount].emaConfHandle = emaCHandle;
       symbolCount++;
    }
 
@@ -289,11 +324,16 @@ int OnInit()
    dailyStartBalance = AccountInfoDouble(ACCOUNT_BALANCE);
    dailyStartDate = TimeCurrent();
 
-   Print("=== DerivSMC_EA v1.25 Started ===");
+   RebuildLossPauses();
+
+   Print("=== DerivSMC_EA v1.26 Started ===");
    Print("Symbols loaded: ", symbolCount,
          " | from file=", (SymbolsFromFile ? SymbolsFile : "SymbolsList"),
          " | Structure=", UseMarketStructure,
-         " | M1 timing=", UseM1EntryTiming);
+         " | M1 timing=", UseM1EntryTiming,
+         " | ConfirmTF=", (UseConfirmTFTrend ? EnumToString(ConfirmTF) : "off"),
+         " | spike filter=", UseSpikeDirectionFilter,
+         " | max daily loss $", MaxDailyLossMoney);
    for(int i=0; i<symbolCount; i++)
       Print("  → ", symbols[i].name, " | Risk: $", symbols[i].risk);
 
@@ -307,6 +347,8 @@ void OnDeinit(const int reason)
    {
       if(symbols[i].atrHandle != INVALID_HANDLE) IndicatorRelease(symbols[i].atrHandle);
       if(symbols[i].emaHandle != INVALID_HANDLE) IndicatorRelease(symbols[i].emaHandle);
+      if(symbols[i].atrExecHandle != INVALID_HANDLE) IndicatorRelease(symbols[i].atrExecHandle);
+      if(symbols[i].emaConfHandle != INVALID_HANDLE) IndicatorRelease(symbols[i].emaConfHandle);
    }
    Print("DerivSMC_EA removed");
 }
@@ -316,6 +358,13 @@ void OnTick()
 {
    ManageOpenPositions();
    ManagePendingOrders();
+
+   static datetime lastGVClean = 0;
+   if(TimeCurrent() - lastGVClean >= 3600)
+   {
+      lastGVClean = TimeCurrent();
+      CleanupRiskGlobals();
+   }
 
    if(!CheckDailyLossLimit()) return;
    if(UseNewsFilter && IsNewsTime()) return;
@@ -360,6 +409,12 @@ void OnTick()
          continue;
       }
 
+      if(UseConfirmTFTrend && GetConfirmTrend(i) != trend)
+      {
+         ClearPending(i);
+         continue; // M15 does not agree with H1: skip this setup bar
+      }
+
       if(UseMarketStructure)
       {
          int structure = GetMarketStructure(sym);
@@ -388,7 +443,7 @@ void OnTick()
          if(signal != 0) setupType = 3;
       }
 
-      if(signal == 0)
+      if(signal == 0 || SpikeDirectionBlocked(sym, signal))
       {
          ClearPending(i);
          continue;
@@ -423,7 +478,10 @@ void OnTick()
 
 bool IsSymbolBlocked(int idx)
 {
-   return (symbols[idx].blockedUntil > 0 && TimeCurrent() < symbols[idx].blockedUntil);
+   datetime now = TimeCurrent();
+   if(symbols[idx].blockedUntil > 0 && now < symbols[idx].blockedUntil) return true;
+   if(symbols[idx].pausedUntil  > 0 && now < symbols[idx].pausedUntil)  return true;
+   return false;
 }
 
 void ClearPending(int idx)
@@ -641,6 +699,254 @@ double MoneyToPriceDistance(string sym, double lot, double money)
    return money * tickSize / (tickValue * lot);
 }
 
+//------------------- v1.26 HELPERS ----------------------------------
+string UpperName(string sym)
+{
+   string u = sym;
+   StringToUpper(u);
+   return u;
+}
+
+bool IsSpikeSymbol(string sym)
+{
+   string u = UpperName(sym);
+   return (StringFind(u, "BOOM") >= 0 || StringFind(u, "CRASH") >= 0 ||
+           StringFind(u, "DEX") >= 0  || StringFind(u, "JUMP") >= 0);
+}
+
+// true = this direction trades against the symbol's spikes
+bool SpikeDirectionBlocked(string sym, int signal)
+{
+   if(!UseSpikeDirectionFilter) return false;
+   string u = UpperName(sym);
+   bool dex = (StringFind(u, "DEX") >= 0);
+   if(signal == -1 && (StringFind(u, "BOOM") >= 0 || (dex && StringFind(u, "UP") >= 0)))
+      return true;
+   if(signal == 1 && (StringFind(u, "CRASH") >= 0 || (dex && StringFind(u, "DOWN") >= 0)))
+      return true;
+   return false;
+}
+
+int FindSymbolIndex(string sym)
+{
+   for(int i = 0; i < symbolCount; i++)
+      if(symbols[i].name == sym) return i;
+   return -1;
+}
+
+double GetBufVal(int handle, int shift)
+{
+   if(handle == INVALID_HANDLE) return 0;
+   double b[];
+   if(CopyBuffer(handle, 0, shift, 1, b) < 1) return 0;
+   return b[0];
+}
+
+// ConfirmTF (M15) EMA trend: close above/below a rising/falling EMA
+int GetConfirmTrend(int idx)
+{
+   double ema[];
+   ArraySetAsSeries(ema, true);
+   if(CopyBuffer(symbols[idx].emaConfHandle, 0, 0, 3, ema) < 3) return 0;
+   double close1 = iClose(symbols[idx].name, ConfirmTF, 1);
+   if(close1 <= 0) return 0;
+   if(close1 > ema[1] && ema[1] >= ema[2]) return 1;
+   if(close1 < ema[1] && ema[1] <= ema[2]) return -1;
+   return 0;
+}
+
+// Last closed M1 or setup-TF bar much bigger than normal = spike/news candle
+bool IsBigCandle(int idx)
+{
+   if(!UseBigCandleFilter || BigCandleATRMult <= 0) return false;
+   string sym = symbols[idx].name;
+
+   double atrX = GetBufVal(symbols[idx].atrExecHandle, 1);
+   double rX   = iHigh(sym, ExecTF, 1) - iLow(sym, ExecTF, 1);
+   if(atrX > 0 && rX > BigCandleATRMult * atrX)
+   {
+      Print(sym, " skipped: big ", EnumToString(ExecTF), " candle (range ",
+            DoubleToString(rX / atrX, 1), "x ATR)");
+      return true;
+   }
+   double atrE = GetBufVal(symbols[idx].atrHandle, 1);
+   double rE   = iHigh(sym, EntryTF, 1) - iLow(sym, EntryTF, 1);
+   if(atrE > 0 && rE > BigCandleATRMult * atrE)
+   {
+      Print(sym, " skipped: big ", EnumToString(EntryTF), " candle (range ",
+            DoubleToString(rE / atrE, 1), "x ATR)");
+      return true;
+   }
+   return false;
+}
+
+// Price already ran too far past the setup zone in the trade direction
+bool IsChasing(int idx, int signal, double bid, double ask, double atrE)
+{
+   if(MaxChaseATR <= 0 || atrE <= 0) return false;
+   double zLo = symbols[idx].zoneLo;
+   double zHi = symbols[idx].zoneHi;
+   if(zLo <= 0 || zHi <= 0) return false;
+   double lim = MaxChaseATR * atrE;
+   if(signal == 1 && ask > zHi + lim)
+   {
+      Print(symbols[idx].name, " skipped: chasing BUY (ask ", ask, " > zone high ", zHi, " + ",
+            DoubleToString(MaxChaseATR, 2), " ATR)");
+      return true;
+   }
+   if(signal == -1 && bid < zLo - lim)
+   {
+      Print(symbols[idx].name, " skipped: chasing SELL (bid ", bid, " < zone low ", zLo, " - ",
+            DoubleToString(MaxChaseATR, 2), " ATR)");
+      return true;
+   }
+   return false;
+}
+
+//------------------- CLOSED P/L, DAILY STOP, LOSS PAUSE (v1.26) ------
+// Closed P/L today (server day) for this EA's magic
+double TodayClosedPL()
+{
+   long nowL = (long)TimeCurrent();
+   datetime dayStart = (datetime)(nowL - nowL % 86400);
+   if(!HistorySelect(dayStart, TimeCurrent() + 60)) return 0;
+   double pl = 0;
+   int n = HistoryDealsTotal();
+   for(int i = 0; i < n; i++)
+   {
+      ulong d = HistoryDealGetTicket(i);
+      if(d == 0) continue;
+      if(HistoryDealGetInteger(d, DEAL_MAGIC) != MagicNumber) continue;
+      long dtype = HistoryDealGetInteger(d, DEAL_TYPE);
+      if(dtype != DEAL_TYPE_BUY && dtype != DEAL_TYPE_SELL) continue;
+      pl += HistoryDealGetDouble(d, DEAL_PROFIT)
+          + HistoryDealGetDouble(d, DEAL_SWAP)
+          + HistoryDealGetDouble(d, DEAL_COMMISSION);
+   }
+   return pl;
+}
+
+// Count a closed deal toward the per-symbol consecutive-loss pause
+void ProcessClosedDeal(ulong deal, bool live)
+{
+   if(deal == 0) return;
+   if(HistoryDealGetInteger(deal, DEAL_MAGIC) != MagicNumber) return;
+   long entry = HistoryDealGetInteger(deal, DEAL_ENTRY);
+   if(entry != DEAL_ENTRY_OUT && entry != DEAL_ENTRY_INOUT && entry != DEAL_ENTRY_OUT_BY) return;
+
+   string sym = HistoryDealGetString(deal, DEAL_SYMBOL);
+   int idx = FindSymbolIndex(sym);
+   if(idx < 0) return;
+
+   double pl = HistoryDealGetDouble(deal, DEAL_PROFIT)
+             + HistoryDealGetDouble(deal, DEAL_SWAP)
+             + HistoryDealGetDouble(deal, DEAL_COMMISSION);
+   datetime t = (datetime)HistoryDealGetInteger(deal, DEAL_TIME);
+
+   if(pl < 0)
+   {
+      symbols[idx].consecLosses++;
+      if(ConsecLossPause > 0 && symbols[idx].consecLosses >= ConsecLossPause)
+      {
+         symbols[idx].pausedUntil = t + SymbolPauseHours * 3600;
+         symbols[idx].consecLosses = 0;
+         if(live || symbols[idx].pausedUntil > TimeCurrent())
+            Print(sym, " paused after ", ConsecLossPause, " losses in a row until ",
+                  TimeToString(symbols[idx].pausedUntil, TIME_DATE | TIME_MINUTES), " (server)");
+      }
+   }
+   else
+      symbols[idx].consecLosses = 0;
+}
+
+// Rebuild loss streaks/pauses from recent history (survives EA restart)
+void RebuildLossPauses()
+{
+   datetime now = TimeCurrent();
+   int back = 2 * 86400;
+   if(SymbolPauseHours * 3600 * 2 > back) back = SymbolPauseHours * 3600 * 2;
+   if(!HistorySelect(now - back, now + 60)) return;
+   int n = HistoryDealsTotal();
+   for(int i = 0; i < n; i++)
+   {
+      ulong d = HistoryDealGetTicket(i);
+      if(d > 0) ProcessClosedDeal(d, false);
+   }
+}
+
+void OnTradeTransaction(const MqlTradeTransaction &trans,
+                        const MqlTradeRequest &request,
+                        const MqlTradeResult &result)
+{
+   if(trans.type != TRADE_TRANSACTION_DEAL_ADD || trans.deal == 0) return;
+   if(!HistoryDealSelect(trans.deal)) return;
+   ProcessClosedDeal(trans.deal, true);
+   plDirty = true;
+}
+
+//------------------- INITIAL RISK PER TICKET (v1.26) -----------------
+string RiskGVName(ulong ticket)
+{
+   return "DSMC_" + IntegerToString(MagicNumber) + "_R_" + IntegerToString((long)ticket);
+}
+
+void StoreInitialRisk(ulong ticket, double dist)
+{
+   if(ticket == 0 || dist <= 0) return;
+   GlobalVariableSet(RiskGVName(ticket), dist);
+}
+
+// Initial entry-to-SL distance: terminal global variable, else the SL of the
+// opening order in history, else the current SL if it is still on the loss side
+double GetInitialRiskDist(ulong ticket, ulong posId, double openPrice, double currentSL, long type)
+{
+   string gv = RiskGVName(ticket);
+   if(GlobalVariableCheck(gv))
+   {
+      double v = GlobalVariableGet(gv);
+      if(v > 0) return v;
+   }
+
+   double dist = 0;
+   if(HistorySelectByPosition(posId > 0 ? posId : ticket))
+   {
+      int n = HistoryDealsTotal();
+      for(int i = 0; i < n; i++)
+      {
+         ulong d = HistoryDealGetTicket(i);
+         if(d == 0) continue;
+         if(HistoryDealGetInteger(d, DEAL_ENTRY) != DEAL_ENTRY_IN) continue;
+         ulong ord = (ulong)HistoryDealGetInteger(d, DEAL_ORDER);
+         double osl = 0;
+         if(ord > 0) osl = HistoryOrderGetDouble(ord, ORDER_SL);
+         if(osl > 0) dist = MathAbs(openPrice - osl);
+         break;
+      }
+   }
+   if(dist <= 0 && currentSL > 0)
+   {
+      if(type == POSITION_TYPE_BUY && currentSL < openPrice)   dist = openPrice - currentSL;
+      if(type == POSITION_TYPE_SELL && currentSL > openPrice)  dist = currentSL - openPrice;
+   }
+   if(dist > 0) GlobalVariableSet(gv, dist);
+   return dist;
+}
+
+// Remove risk globals whose position/order no longer exists
+void CleanupRiskGlobals()
+{
+   string prefix = "DSMC_" + IntegerToString(MagicNumber) + "_R_";
+   for(int i = GlobalVariablesTotal() - 1; i >= 0; i--)
+   {
+      string nm = GlobalVariableName(i);
+      if(StringFind(nm, prefix) != 0) continue;
+      ulong t = (ulong)StringToInteger(StringSubstr(nm, StringLen(prefix)));
+      if(t == 0) continue;
+      if(PositionSelectByTicket(t) || OrderSelect(t)) continue;
+      GlobalVariableDel(nm);
+   }
+}
+
 //------------------- PRICE / STOP-LEVEL HELPERS (v1.25) --------------
 double SymTickSize(string sym)
 {
@@ -721,6 +1027,8 @@ bool OpenTrade(int idx, int signal)
    string sym = symbols[idx].name;
    double risk = symbols[idx].risk;
    if(risk <= 0) return false;
+   if(SpikeDirectionBlocked(sym, signal)) return false;
+   if(IsBigCandle(idx)) return false;
 
    double atr[];
    ArraySetAsSeries(atr, true);
@@ -780,7 +1088,7 @@ bool OpenTrade(int idx, int signal)
    double minLot = SymbolInfoDouble(sym, SYMBOL_VOLUME_MIN);
    double step   = SymbolInfoDouble(sym, SYMBOL_VOLUME_STEP);
    if(lot <= 0 || lot < minLot)
-      return TryDeepLimit(idx, signal, sl, bid, ask, minDist);
+      return TryDeepLimit(idx, signal, sl, bid, ask, minDist, atr[0]);
 
    double loss = LossAtSL(sym, signal, lot, price, sl);
    int guard = 0;
@@ -792,12 +1100,14 @@ bool OpenTrade(int idx, int signal)
       guard++;
    }
    if(loss >= 0 && (lot <= 0 || lot < minLot))
-      return TryDeepLimit(idx, signal, sl, bid, ask, minDist);
+      return TryDeepLimit(idx, signal, sl, bid, ask, minDist, atr[0]);
    if(lot <= 0 || lot < minLot || loss < 0 || loss > risk)
    {
       Print(sym, " skipped: cannot keep loss at SL <= $", risk, " (loss=", DoubleToString(loss, 2), ")");
       return false;
    }
+
+   if(IsChasing(idx, signal, bid, ask, atr[0])) return false;
 
    SetFillingForSymbol(sym);
 
@@ -808,6 +1118,9 @@ bool OpenTrade(int idx, int signal)
    uint rc = trade.ResultRetcode();
    if(ok && (rc == TRADE_RETCODE_DONE || rc == TRADE_RETCODE_PLACED || rc == TRADE_RETCODE_DONE_PARTIAL))
    {
+      double fill = trade.ResultPrice();
+      if(fill <= 0) fill = price;
+      StoreInitialRisk(trade.ResultOrder(), MathAbs(fill - sl));
       Print(sym, " market ", (signal == 1 ? "BUY" : "SELL"), " lot ", lot,
             " sl ", sl, " tp ", tp, " max loss $", DoubleToString(loss, 2));
       symbols[idx].stopsFails = 0;
@@ -827,7 +1140,7 @@ bool OpenTrade(int idx, int signal)
    return false;
 }
 
-//------------------- DEEP LIMIT FALLBACK (v1.25) --------------------
+//------------------- DEEP LIMIT FALLBACK (v1.25, levels in v1.26) ----
 // Setup zone of the bars the detector used (EntryTF, closed bars)
 void GetSetupZone(string sym, int setupType, double &lo, double &hi)
 {
@@ -845,9 +1158,46 @@ void GetSetupZone(string sym, int setupType, double &lo, double &hi)
    }
 }
 
+// Swing lows (lows=true) or swing highs on any timeframe, closed bars only
+void CollectSwingLevels(string sym, ENUM_TIMEFRAMES tf, bool lows, int lookback, double &levels[])
+{
+   int strength = SwingStrength;
+   if(strength < 1) strength = 1;
+   if(lookback < strength * 2 + 1) lookback = strength * 2 + 1;
+   for(int shift = strength; shift <= lookback; shift++)
+   {
+      double v = (lows ? iLow(sym, tf, shift) : iHigh(sym, tf, shift));
+      if(v <= 0) continue;
+      bool isSwing = true;
+      for(int k = 1; k <= strength; k++)
+      {
+         double a = (lows ? iLow(sym, tf, shift + k) : iHigh(sym, tf, shift + k));
+         double b = (lows ? iLow(sym, tf, shift - k) : iHigh(sym, tf, shift - k));
+         if(a <= 0 || b <= 0) { isSwing = false; break; }
+         if(lows  && (a <= v || b <= v)) { isSwing = false; break; }
+         if(!lows && (a >= v || b >= v)) { isSwing = false; break; }
+      }
+      if(!isSwing) continue;
+      int n = ArraySize(levels);
+      ArrayResize(levels, n + 1);
+      levels[n] = v;
+   }
+}
+
+// Keep the candidate nearest to the market (most likely to fill)
+void ConsiderDeepPrice(int signal, double cand, string src, double &best, string &bestSrc)
+{
+   if(cand <= 0) return;
+   if(best == 0 || (signal == 1 && cand > best) || (signal == -1 && cand < best))
+   {
+      best = cand;
+      bestSrc = src;
+   }
+}
+
 // Min lot is too big for RiskMoney at market: place a limit closer to the same SL
-// so that min lot loses <= RiskMoney at SL. Only inside the setup zone.
-bool TryDeepLimit(int idx, int signal, double sl, double bid, double ask, double minDist)
+// so that min lot loses <= RiskMoney at SL, at the setup zone or a swing level.
+bool TryDeepLimit(int idx, int signal, double sl, double bid, double ask, double minDist, double atrE)
 {
    string sym  = symbols[idx].name;
    double risk = symbols[idx].risk;
@@ -858,11 +1208,6 @@ bool TryDeepLimit(int idx, int signal, double sl, double bid, double ask, double
    if(!UseDeepLimitFallback)
    {
       Print(sym, " skipped: min lot would risk more than $", risk);
-      return false;
-   }
-   if(zLo <= 0 || zHi <= 0 || zHi <= zLo)
-   {
-      Print(sym, " deep limit fallback: no setup zone - skipped");
       return false;
    }
 
@@ -882,9 +1227,66 @@ bool TryDeepLimit(int idx, int signal, double sl, double bid, double ask, double
       return false;
    }
 
-   double lp;
-   if(signal == 1) lp = RoundToTick(sym, sl + allowDist, -1);   // round toward SL = less risk
-   else            lp = RoundToTick(sym, sl - allowDist, 1);
+   // Valid price range: far enough from SL, within the $ cap, far enough from market
+   double loP, hiP;
+   if(signal == 1)
+   {
+      loP = sl + minDist;
+      hiP = MathMin(sl + allowDist, ask - minDist);
+   }
+   else
+   {
+      hiP = sl - minDist;
+      loP = MathMax(sl - allowDist, bid + minDist);
+   }
+   if(hiP < loP)
+   {
+      Print(sym, " deep limit fallback: no room between SL ", sl, " and market for a ",
+            side, " - skipped");
+      return false;
+   }
+
+   double best = 0;
+   string bestSrc = "";
+   double tol = DeepLevelTolATR * atrE;
+   if(tol < 0) tol = 0;
+
+   // a) setup candles (CRT / rejection / OB range)
+   if(zLo > 0 && zHi > zLo)
+   {
+      double a = MathMax(zLo, loP);
+      double b = MathMin(zHi, hiP);
+      if(a <= b) ConsiderDeepPrice(signal, (signal == 1 ? b : a), "setup zone", best, bestSrc);
+   }
+
+   // b) swing support (buys) / resistance (sells) on EntryTF, ConfirmTF and TrendTF
+   double levels[];
+   ArrayResize(levels, 0);
+   bool lows = (signal == 1);
+   CollectSwingLevels(sym, EntryTF,   lows, DeepLimitLookback, levels);
+   CollectSwingLevels(sym, ConfirmTF, lows, DeepLimitLookback, levels);
+   CollectSwingLevels(sym, TrendTF,   lows, DeepLimitLookback, levels);
+   int nl = ArraySize(levels);
+   for(int i = 0; i < nl; i++)
+   {
+      double a = MathMax(levels[i] - tol, loP);
+      double b = MathMin(levels[i] + tol, hiP);
+      if(a <= b) ConsiderDeepPrice(signal, (signal == 1 ? b : a), "swing level " + DoubleToString(levels[i], 5), best, bestSrc);
+   }
+
+   // c) optional: any price inside the valid range
+   if(!DeepLimitRequireLevel)
+      ConsiderDeepPrice(signal, (signal == 1 ? hiP : loP), "risk cap", best, bestSrc);
+
+   if(best <= 0)
+   {
+      Print(sym, " deep limit fallback: no setup zone or swing level in valid range [",
+            DoubleToString(loP, 5), " - ", DoubleToString(hiP, 5), "] - skipped");
+      return false;
+   }
+
+   // Round toward the SL (less risk, further from market)
+   double lp = (signal == 1 ? RoundToTick(sym, best, -1) : RoundToTick(sym, best, 1));
 
    // Re-verify actual loss; step toward the SL (never past min distance) if needed
    double loss = LossAtSL(sym, signal, lot, lp, sl);
@@ -899,14 +1301,6 @@ bool TryDeepLimit(int idx, int signal, double sl, double bid, double ask, double
    if(loss < 0 || loss > risk || MathAbs(lp - sl) < minDist)
    {
       Print(sym, " deep limit fallback: cannot keep loss <= $", risk, " - skipped");
-      return false;
-   }
-
-   // Limit price must be in the setup zone and far enough from the market
-   if(lp < zLo || lp > zHi)
-   {
-      Print(sym, " deep limit fallback: ", side, " ", lp, " outside setup zone [",
-            zLo, " - ", zHi, "] - skipped");
       return false;
    }
    if(signal == 1 && lp > ask - minDist)
@@ -945,8 +1339,9 @@ bool TryDeepLimit(int idx, int signal, double sl, double bid, double ask, double
 
    if(ok && (rc == TRADE_RETCODE_DONE || rc == TRADE_RETCODE_PLACED))
    {
-      Print(sym, " deep limit fallback: ", side, " ", lp, " lot ", lot, " sl ", sl, " tp ", tp,
-            " max loss $", DoubleToString(loss, 2),
+      StoreInitialRisk(trade.ResultOrder(), slD);
+      Print(sym, " deep limit fallback: ", side, " ", lp, " at ", bestSrc, " lot ", lot,
+            " sl ", sl, " tp ", tp, " max loss $", DoubleToString(loss, 2),
             (tt == ORDER_TIME_SPECIFIED ? " (broker expiry)" : " (manual expiry)"));
       symbols[idx].stopsFails = 0;
       return true;
@@ -960,7 +1355,7 @@ bool TryDeepLimit(int idx, int signal, double sl, double bid, double ask, double
    return false;
 }
 
-// Cancel our pending limits when they are too old or the H1 trend flips
+// Cancel our pending limits: too old, H1 trend flipped, daily stop, or symbol paused
 void ManagePendingOrders()
 {
    static datetime lastRun = 0;
@@ -983,19 +1378,25 @@ void ManagePendingOrders()
       string why = "";
       if(LimitExpireMinutes > 0 && now - setup >= LimitExpireMinutes * 60)
          why = "expired";
+      else if(dailyStopActive)
+         why = "daily loss stop";
       else
       {
-         for(int s = 0; s < symbolCount; s++)
+         int s = FindSymbolIndex(sym);
+         if(s >= 0)
          {
-            if(symbols[s].name != sym) continue;
-            int trend = GetTrendDirection(s);
-            if(trend == -dir) why = "trend flipped";
-            break;
+            if(symbols[s].pausedUntil > 0 && now < symbols[s].pausedUntil)
+               why = "symbol paused";
+            else if(GetTrendDirection(s) == -dir)
+               why = "trend flipped";
          }
       }
       if(why == "") continue;
       if(trade.OrderDelete(ticket))
+      {
+         GlobalVariableDel(RiskGVName(ticket));
          Print(sym, " deep limit fallback: order #", ticket, " deleted (", why, ")");
+      }
    }
 }
 
@@ -1010,27 +1411,29 @@ int ModStateIndex(ulong ticket)
    modStates[n].nextAllowed = 0;
    modStates[n].lastRejectedSL = 0;
    modStates[n].fails = 0;
+   modStates[n].riskDist = 0;
    return n;
 }
 
-// Drop throttle entries for positions that are closed
+// Drop throttle entries (and risk globals) for positions that are closed
 void PruneModStates()
 {
    int n = ArraySize(modStates);
    for(int i = n - 1; i >= 0; i--)
    {
       if(PositionSelectByTicket(modStates[i].ticket)) continue;
+      GlobalVariableDel(RiskGVName(modStates[i].ticket));
       int last = ArraySize(modStates) - 1;
       if(i != last) modStates[i] = modStates[last];
       ArrayResize(modStates, last);
    }
 }
 
-//------------------- MANAGE OPEN POSITIONS (Trailing + BE) ----------
+//------------------- MANAGE OPEN POSITIONS (R-based BE + ATR trail) --
 void ManageOpenPositions()
 {
-   if(!UseBreakEven && !UseTrailingStop) return;
    PruneModStates();
+   if(!UseBreakEven && !UseTrailingStop) return;
    datetime now = TimeCurrent();
 
    for(int i = PositionsTotal() - 1; i >= 0; i--)
@@ -1044,14 +1447,19 @@ void ManageOpenPositions()
       double currentSL = PositionGetDouble(POSITION_SL);
       double currentTP = PositionGetDouble(POSITION_TP);
       long   type = PositionGetInteger(POSITION_TYPE);
-      double profit = PositionGetDouble(POSITION_PROFIT);
       double lot = PositionGetDouble(POSITION_VOLUME);
-
-      bool wantBE    = (UseBreakEven && profit >= BreakEvenTrigger);
-      bool wantTrail = (UseTrailingStop && profit >= TrailingStart);
-      if(!wantBE && !wantTrail) continue;
+      ulong  posId = (ulong)PositionGetInteger(POSITION_IDENTIFIER);
 
       int ms = ModStateIndex(ticket);
+      if(modStates[ms].riskDist == 0)
+      {
+         double rd = GetInitialRiskDist(ticket, posId, openPrice, currentSL, type);
+         modStates[ms].riskDist = (rd > 0 ? rd : -1);
+         if(rd <= 0)
+            Print(sym, " #", ticket, " initial risk unknown - BE/trailing off for this trade");
+      }
+      double rDist = modStates[ms].riskDist;
+      if(rDist <= 0) continue;
       if(now < modStates[ms].nextAllowed) continue;   // throttle / backoff
 
       MqlTick tick;
@@ -1059,12 +1467,26 @@ void ManageOpenPositions()
       double bid = tick.bid;
       double ask = tick.ask;
 
+      double profitDist = (type == POSITION_TYPE_BUY ? bid - openPrice : openPrice - ask);
+      double profitR = profitDist / rDist;
+      bool wantBE    = (UseBreakEven && profitR >= BreakEvenAtR);
+      bool wantTrail = (UseTrailingStop && profitR >= TrailStartR);
+      if(!wantBE && !wantTrail) continue;
+
       double ts      = SymTickSize(sym);
       double point   = SymbolInfoDouble(sym, SYMBOL_POINT);
+      double spread  = ask - bid;
+      if(spread < 0) spread = 0;
       double minDist = MinStopDistance(sym, bid, ask, 1);
       double freezeD = (double)SymbolInfoInteger(sym, SYMBOL_TRADE_FREEZE_LEVEL) * point;
       double minImprove = MoneyToPriceDistance(sym, lot, TrailMinImproveMoney);
       if(minImprove < ts) minImprove = ts;
+
+      double beLock = BreakEvenLockR * rDist + spread;
+      double trailDist = 0;
+      int si = FindSymbolIndex(sym);
+      if(si >= 0) trailDist = TrailATRMult * GetBufVal(symbols[si].atrHandle, 1);
+      if(trailDist <= 0) wantTrail = false;
 
       double newSL = 0;
 
@@ -1077,21 +1499,13 @@ void ManageOpenPositions()
          double cand = currentSL;
          if(wantBE)
          {
-            double beOffset = MoneyToPriceDistance(sym, lot, BreakEvenProfit);
-            if(beOffset > 0)
-            {
-               double be = RoundToTick(sym, openPrice + beOffset, -1);
-               if(be > cand) cand = be;
-            }
+            double be = RoundToTick(sym, openPrice + beLock, -1);
+            if(be > cand) cand = be;
          }
          if(wantTrail)
          {
-            double trailDist = MoneyToPriceDistance(sym, lot, TrailingStep);
-            if(trailDist > 0)
-            {
-               double tr = RoundToTick(sym, bid - trailDist, -1);
-               if(tr > cand) cand = tr;
-            }
+            double tr = RoundToTick(sym, bid - trailDist, -1);
+            if(tr > cand) cand = tr;
          }
          double maxSL = RoundToTick(sym, bid - minDist, -1);   // must stay below bid by min dist
          if(cand > maxSL) cand = maxSL;
@@ -1108,21 +1522,13 @@ void ManageOpenPositions()
          double cand = currentSL;   // 0 = no SL yet
          if(wantBE)
          {
-            double beOffset = MoneyToPriceDistance(sym, lot, BreakEvenProfit);
-            if(beOffset > 0)
-            {
-               double be = RoundToTick(sym, openPrice - beOffset, 1);
-               if(cand == 0 || be < cand) cand = be;
-            }
+            double be = RoundToTick(sym, openPrice - beLock, 1);
+            if(cand == 0 || be < cand) cand = be;
          }
          if(wantTrail)
          {
-            double trailDist = MoneyToPriceDistance(sym, lot, TrailingStep);
-            if(trailDist > 0)
-            {
-               double tr = RoundToTick(sym, ask + trailDist, 1);
-               if(cand == 0 || tr < cand) cand = tr;
-            }
+            double tr = RoundToTick(sym, ask + trailDist, 1);
+            if(cand == 0 || tr < cand) cand = tr;
          }
          double minSL = RoundToTick(sym, ask + minDist, 1);    // must stay above ask by min dist
          if(cand > 0 && cand < minSL) cand = minSL;
@@ -1233,17 +1639,45 @@ bool CheckDailyLossLimit()
    {
       dailyStartBalance = AccountInfoDouble(ACCOUNT_BALANCE);
       dailyStartDate = TimeCurrent();
+      plDirty = true;
    }
 
-   if(dailyStartBalance <= 0) return true;
+   bool   stop = false;
+   string why  = "";
 
-   double loss = (dailyStartBalance - AccountInfoDouble(ACCOUNT_BALANCE)) / dailyStartBalance * 100.0;
-   if(loss >= DailyLossLimitPercent)
+   if(dailyStartBalance > 0)
    {
-      Print("Daily loss limit hit. Trading stopped for today.");
-      return false;
+      double lossPct = (dailyStartBalance - AccountInfoDouble(ACCOUNT_BALANCE)) / dailyStartBalance * 100.0;
+      if(lossPct >= DailyLossLimitPercent)
+      {
+         stop = true;
+         why  = "balance down " + DoubleToString(lossPct, 2) + "%";
+      }
    }
-   return true;
+
+   // v1.26: closed P/L today for this EA (server day)
+   if(!stop && MaxDailyLossMoney > 0)
+   {
+      datetime nowT = TimeCurrent();
+      if(plDirty || nowT - lastPLCalc >= 10)
+      {
+         todayClosedPL = TodayClosedPL();
+         lastPLCalc = nowT;
+         plDirty = false;
+      }
+      if(todayClosedPL <= -MaxDailyLossMoney)
+      {
+         stop = true;
+         why  = "closed P/L today $" + DoubleToString(todayClosedPL, 2);
+      }
+   }
+
+   if(stop && !dailyStopActive)
+      Print("Daily loss stop hit (", why, "). No new entries until the next server day.");
+   if(!stop && dailyStopActive)
+      Print("Daily loss stop cleared - new server day.");
+   dailyStopActive = stop;
+   return !stop;
 }
 
 bool IsNewsTime()
